@@ -11,7 +11,16 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                  # install dependencies
 uv run customer-mcp      # run the server on stdio (waits for JSON-RPC on stdin)
-uv run pytest -v         # 83 tests, about 10 s (many spawn the server as a subprocess)
+uv run pytest -v         # 93 tests, about 10 s (many spawn the server as a subprocess)
+```
+
+Protocol-error mode (`-32602` for invalid arguments) instead of the default `isError` results:
+
+```bash
+MCP_VALIDATION_ERRORS=protocol uv run customer-mcp                      # bash
+```
+```powershell
+$env:MCP_VALIDATION_ERRORS="protocol"; uv run customer-mcp   # PowerShell
 ```
 
 Smoke test with the MCP Inspector CLI (needs Node):
@@ -41,7 +50,7 @@ The Inspector's `--tool-arg` coerces argument types (everything on the command l
 }
 ```
 
-On Windows use a path such as `C:\\path\\to\\task1-mcp-server`. The `env` block is optional; the values shown are the defaults.
+On Windows use a path such as `C:\\path\\to\\task1-mcp-server`. The `env` block is optional; the values shown are the defaults. GUI clients (for example Claude Desktop on macOS) may not inherit `PATH`; if `uv` is not found, use the absolute path from `which uv` (`where uv` on Windows) as `"command"`.
 
 ## Tools
 
@@ -103,7 +112,7 @@ Read once at startup, case-insensitively. An invalid value prints a message to s
 | Unexpected exception | JSON-RPC error `-32603`, `"Internal error"`; traceback goes to stderr only |
 | Parse errors, unknown methods, malformed `tools/call` envelope, requests before `initialize` | Left to the SDK (see [Observed SDK behaviour](#observed-sdk-behaviour)) |
 
-Error messages name the offending fields and never echo the rejected value or the refund `reason`; logs record field names only.
+Error messages name the offending fields and never echo rejected argument values or the `reason`; unknown tool names and unrecognised argument names are echoed back escaped and truncated to 64 characters. Logs record field names only (same escaping and cap), folded into the single outcome line of the call.
 
 ### Why `isError` and not `-32602` by default
 
@@ -121,7 +130,8 @@ The stdio transport requires that the server "MUST NOT write anything to its std
 - The SDK's stdio transport claims file descriptor 1 for the wire and points the process-level fd 1 at a copy of stderr, so stray writes from other code, including C extensions, land on stderr rather than in the protocol stream.
 - Tracebacks, including crashes, go to stderr.
 
-Proof is black-box: `tests/test_stdio.py` spawns the real server, speaks raw newline-delimited JSON-RPC, and asserts that every stdout line parses as JSON-RPC, that logs appear only on stderr, and that malformed input does not break the session.
+Proof is black-box: `tests/test_stdio.py` spawns the real server, speaks raw newline-delimited JSON-RPC, and asserts that every stdout line is valid UTF-8 and parses as JSON-RPC, that logs appear only on stderr, and that malformed input does not break the session. `test_stray_prints_cannot_corrupt_stdout` runs the server with a handler that calls `print("STRAY-PRINT")` and `os.write(1, b"STRAY-OSWRITE
+")`: the tool call still succeeds, neither string appears on stdout, and both appear on stderr, which demonstrates the fd-1 diversion directly.
 
 ## Observed SDK behaviour
 
@@ -129,12 +139,16 @@ Recorded by the stdio harness on `mcp` 2.3.0; the server adds no handling for th
 
 | Input | Result |
 |---|---|
-| Non-JSON line after `initialize` | No reply, no stderr output at INFO; server keeps serving |
+| Non-JSON line after `initialize` | No reply, no stderr output at INFO; server keeps serving (see note below) |
 | JSON array (batch), e.g. `[1, 2]` | No reply; server keeps serving |
+| `tools/call` with `arguments` as a string or array, `name` missing or not a string, or `params` omitted | Error `-32602` `"Invalid request parameters"`; server keeps serving |
+| `tools/call` with `params` as an array or string, with an id | No reply (the SDK drops the line at DEBUG); the client times out |
 | Request before `initialize` | Error `-32602` `"Invalid request parameters"`; a later `initialize` and requests work normally |
 | Unknown method | Error `-32601` |
 | Notification | No response |
 | stdin EOF | Process exits with code 0 |
+
+The silent drops (non-JSON lines, and `params` of the wrong type on a request with an id) deviate from JSON-RPC 2.0 section 5, which expects `-32700` or `-32600` with `id: null`. This is SDK 2.3.0 behaviour that the server leaves alone: the SDK owns the read stream (`create_context_streams`), and replacing it is riskier than the deviation.
 
 ## Design notes
 
@@ -142,7 +156,7 @@ Recorded by the stdio harness on `mcp` 2.3.0; the server adds no handling for th
 - **`Decimal` for money.** Balances are held as `Decimal` quantized to cents, so repeated refunds don't accumulate float error. Floats appear only at the JSON boundary.
 - **Annotations.** `get_customer_record` is marked read-only and idempotent; `trigger_refund` is marked destructive and non-idempotent so clients can gate it behind confirmation.
 - **No idempotency key.** The brief specifies three inputs, so a retried `trigger_refund` issues a second refund. A production version would add an optional `idempotency_key` argument, store `key -> receipt`, and return the stored receipt on replay (rejecting a replay whose amount or customer differs).
-- **Single process, in-memory state.** There is no locking because the stdio server handles one client; a networked version would need transactional storage.
+- **Single process, in-memory state.** There is no locking because handlers never `await` between the balance check and the debit, so on a single event loop each refund runs atomically even though the SDK runs every request as its own task and one client can have several calls in flight. A networked or multi-process version would need transactional storage.
 
 ## Spec versions
 
@@ -150,7 +164,7 @@ Built for MCP 2025-11-25 (handshake-based) on `mcp` 2.3.x; the test harness nego
 
 ## Evidence: test suite
 
-`uv sync --locked && uv run ruff check . && uv run pytest -v` gives `All checks passed!` and `83 passed`. Test names from `uv run pytest --collect-only -q`, with parametrized cases abbreviated:
+`uv sync --locked && uv run ruff check . && uv run pytest -v` gives `All checks passed!` and `93 passed`. Test names from `uv run pytest --collect-only -q`, with parametrized cases abbreviated:
 
 ```
 tests/test_config.py
@@ -166,12 +180,17 @@ tests/test_schemas.py
   test_alnum_rejects[CUST-a1b2c | cust-A1B2C | CUST-A1B2]
   test_amount_accepts_json_int_as_float
   test_amount_rejects["50" | True | 0 | -1 | 1e-09 | 10.005 | inf | nan | None]
-  test_reason_rejects["too short" | ten spaces | "  short   " | 501 chars | 1234567890 (number)]
+  test_reason_rejects["too short" | ten spaces | "  short   " | 501 chars | 1234567890 (number)
+                      | ten NULs | ten zero-width spaces | 5 zero-width + "abcd"]
   test_reason_accepts_exactly_10_chars
+  test_reason_accepts_embedded_tab_and_newline
   test_extra_and_missing_fields_rejected
   test_published_schema_is_strict
   test_rendered_message_names_fields_but_never_echoes_input
   test_alnum_hint_wording
+  test_huge_extra_key_is_capped
+  test_extra_key_with_newline_is_escaped
+  test_issue_list_is_capped_at_20
 
 tests/test_server.py
   test_tools_list_publishes_strict_schemas_and_annotations
@@ -186,6 +205,7 @@ tests/test_server.py
   test_unexpected_exception_is_32603_without_leak
   test_unknown_tool_name_is_never_logged_raw
   test_unknown_tool_name_echo_is_truncated
+  test_invalid_call_emits_exactly_one_log_record
 
 tests/test_stdio.py
   test_handshake_and_tools_list
@@ -195,6 +215,8 @@ tests/test_stdio.py
   test_unknown_tool_32602
   test_unknown_method_32601
   test_junk_input_does_not_break_server
+  test_malformed_tools_call_arguments_is_32602
+  test_stray_prints_cannot_corrupt_stdout
   test_request_before_initialize_does_not_break_server
   test_logs_go_to_stderr_only
   test_crash_traceback_on_stderr_not_stdout
@@ -217,5 +239,5 @@ tests/test_store.py
   test_seeded_stores_are_independent
   test_huge_amount_rejected_as_business_error[1e+30 | 1e+300]
 
-83 passed
+93 passed
 ```
