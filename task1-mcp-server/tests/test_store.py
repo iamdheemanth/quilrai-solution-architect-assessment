@@ -93,3 +93,11 @@ def test_seeded_stores_are_independent():
     a.refund("CUST-00001", 100, "Refund for outage")
     assert b.get("CUST-00001").refundable_balance == 500.0
     assert b.refund("CUST-00001", 1, "Refund for outage").refund_id == "RF-000001"
+
+
+@pytest.mark.parametrize("amount", [1e30, 1e300])
+def test_huge_amount_rejected_as_business_error(store, amount):
+    with pytest.raises(RefundRejected, match="exceeds"):
+        store.refund("CUST-00001", amount, "Large refund request")
+    assert store.get("CUST-00001").refundable_balance == 500.0
+    assert store.refund("CUST-00001", 1, "Follow up refund").refund_id == "RF-000001"

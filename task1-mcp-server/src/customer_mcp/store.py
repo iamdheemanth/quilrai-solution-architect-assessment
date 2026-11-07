@@ -78,13 +78,14 @@ class CustomerStore:
             raise RefundRejected(
                 f"Account {customer_id} is suspended; refunds are not permitted"
             )
-        value = _money(amount)
+        value = Decimal(str(amount))
         balance = self._balances[customer_id]
         if value > balance:
             raise RefundRejected(
                 f"Refund of {value:.2f} exceeds refundable balance of {balance:.2f} "
                 f"for {customer_id}"
             )
+        value = _money(value)
         remaining = balance - value
         self._balances[customer_id] = remaining
         self._refund_counter += 1
