@@ -41,7 +41,14 @@ class RawStdioSession:
     def _pump(self, pipe, sink: list[str], is_stdout: bool) -> None:
         try:
             for raw in iter(pipe.readline, b""):
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if is_stdout:
+                    try:
+                        line = raw.decode("utf-8").rstrip("\r\n")
+                    except UnicodeDecodeError:
+                        # Not valid UTF-8: record a marker that assert_pure rejects.
+                        line = f"<INVALID-UTF8 {raw[:60]!r}>"
+                else:
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 with self._cond:
                     sink.append(line)
                     self._cond.notify_all()

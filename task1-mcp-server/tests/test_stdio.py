@@ -12,6 +12,7 @@ from tests.rawstdio import RawStdioSession
 HERE = Path(__file__).parent
 SERVER_CMD = [sys.executable, "-m", "customer_mcp"]
 CRASH_CMD = [sys.executable, str(HERE / "crashing_server.py")]
+PRINT_CMD = [sys.executable, str(HERE / "printing_server.py")]
 
 
 def assert_pure(session: RawStdioSession) -> None:
@@ -38,7 +39,8 @@ def make_session():
 
     def factory(env_overrides=None, cmd=None):
         env = dict(os.environ)
-        env.pop("LOG_LEVEL", None)
+        for var in ("LOG_LEVEL", "MCP_VALIDATION_ERRORS", "CUSTOMER_ID_CHARSET"):
+            env.pop(var, None)  # ambient config must not leak into the child
         env.update(env_overrides or {})
         session = RawStdioSession(cmd or SERVER_CMD, env=env)
         sessions.append(session)
@@ -60,6 +62,8 @@ def test_handshake_and_tools_list(s):
     init = s.initialize()
     assert init["result"]["capabilities"]["tools"] is not None
     tools = s.request("tools/list")["result"]["tools"]
+    assert init["result"]["serverInfo"]["name"] == "customer-service-mcp"
+    assert init["result"]["serverInfo"]["version"] == "1.0.0"
     assert {t["name"] for t in tools} == {"get_customer_record", "trigger_refund"}
 
 
@@ -109,11 +113,31 @@ def test_junk_input_does_not_break_server(s):
     s.send("[1, 2]")
     assert s.request("tools/list")["result"]["tools"]  # still serving
     s.close()
-    for line in s.stdout_lines:
-        obj = json.loads(line)
-        if "error" in obj and obj.get("id") is None:
-            # an id-less error reply to junk: a parse error must carry -32700
-            assert obj["error"]["code"] in (-32700, -32600, -32602), line
+    # SDK 2.3.0 drops both junk lines silently; the only replies are initialize and tools/list.
+    replies = [json.loads(line) for line in s.stdout_lines]
+    assert [r["id"] for r in replies] == [1, 2]
+
+
+def test_malformed_tools_call_arguments_is_32602(s):
+    s.initialize()
+    resp = s.request("tools/call", {"name": "get_customer_record", "arguments": "x"})
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == "Invalid request parameters"
+    assert s.request("tools/list")["result"]["tools"]  # still serving
+
+
+def test_stray_prints_cannot_corrupt_stdout(make_session):
+    s = make_session(cmd=PRINT_CMD)
+    s.initialize()
+    resp = s.request(
+        "tools/call",
+        {"name": "get_customer_record", "arguments": {"customer_id": "CUST-00001"}},
+    )
+    assert resp["result"]["isError"] is False
+    s.close()
+    for marker in ("STRAY-PRINT", "STRAY-OSWRITE"):
+        assert all(marker not in line for line in s.stdout_lines)
+        assert marker in s.stderr_text
 
 
 def test_request_before_initialize_does_not_break_server(s):
