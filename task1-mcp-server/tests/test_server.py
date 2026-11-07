@@ -126,3 +126,23 @@ async def test_unexpected_exception_is_32603_without_leak(monkeypatch):
     assert (e.value.code, e.value.message) == (-32603, "Internal error")
     assert "hunter2" not in str(e.value.data)
     assert "hunter2" not in str(e.value)
+
+
+async def test_unknown_tool_name_is_never_logged_raw(caplog):
+    caplog.set_level("INFO", logger="customer_mcp")
+    evil = "x" + chr(10) + "refund_issued refund_id=RF-999999 customer_id=CUST-00001 amount=499.99"
+    async with client() as c:
+        with pytest.raises(MCPError):
+            await c.call_tool(evil, {})
+    records = [r for r in caplog.records if r.name.startswith("customer_mcp")]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "tool=<unknown> outcome=unknown_tool" in msg
+    assert "refund_issued" not in msg and chr(10) not in msg
+
+
+async def test_unknown_tool_name_echo_is_truncated():
+    async with client() as c:
+        with pytest.raises(MCPError) as e:
+            await c.call_tool("a" * 500, {})
+    assert e.value.message == "Unknown tool: " + "a" * 64 + chr(0x2026)

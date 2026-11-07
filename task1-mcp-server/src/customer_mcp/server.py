@@ -25,6 +25,7 @@ SERVER_NAME = "customer-service-mcp"
 SERVER_VERSION = "0.1.0"
 
 log = logging.getLogger("customer_mcp.server")
+_MAX_ECHO = 64
 
 
 @dataclass(frozen=True)
@@ -125,8 +126,10 @@ def build_server(settings: Settings, store: CustomerStore) -> Server:
         name = params.name
         spec = specs.get(name)
         if spec is None:
-            _log_call(name, "unknown_tool", started)
-            raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {name}")
+            # Client-controlled: never log the name (log forging); cap the wire echo.
+            _log_call("<unknown>", "unknown_tool", started)
+            shown = name if len(name) <= _MAX_ECHO else name[:_MAX_ECHO] + "…"
+            raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {shown}")
 
         try:
             args = spec.args_model.model_validate(params.arguments or {})
