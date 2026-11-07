@@ -130,8 +130,7 @@ The stdio transport requires that the server "MUST NOT write anything to its std
 - The SDK's stdio transport claims file descriptor 1 for the wire and points the process-level fd 1 at a copy of stderr, so stray writes from other code, including C extensions, land on stderr rather than in the protocol stream.
 - Tracebacks, including crashes, go to stderr.
 
-Proof is black-box: `tests/test_stdio.py` spawns the real server, speaks raw newline-delimited JSON-RPC, and asserts that every stdout line is valid UTF-8 and parses as JSON-RPC, that logs appear only on stderr, and that malformed input does not break the session. `test_stray_prints_cannot_corrupt_stdout` runs the server with a handler that calls `print("STRAY-PRINT")` and `os.write(1, b"STRAY-OSWRITE
-")`: the tool call still succeeds, neither string appears on stdout, and both appear on stderr, which demonstrates the fd-1 diversion directly.
+Proof is black-box: `tests/test_stdio.py` spawns the real server, speaks raw newline-delimited JSON-RPC, and asserts that every stdout line is valid UTF-8 and parses as JSON-RPC, that logs appear only on stderr, and that malformed input does not break the session. `test_stray_prints_cannot_corrupt_stdout` runs the server with a handler that calls `print("STRAY-PRINT")` and `os.write(1, b"STRAY-OSWRITE\n")`: the tool call still succeeds, neither string appears on stdout, and both appear on stderr, which demonstrates the fd-1 diversion directly.
 
 ## Observed SDK behaviour
 
