@@ -11,6 +11,7 @@ from mcp.server.lowlevel import Server
 from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, ValidationError
 
+from customer_mcp import __version__
 from customer_mcp.config import Settings
 from customer_mcp.schemas import (
     CustomerRecord,
@@ -22,7 +23,6 @@ from customer_mcp.store import BusinessError, CustomerStore
 from customer_mcp.validation import describe_validation_error, render_issues
 
 SERVER_NAME = "customer-service-mcp"
-SERVER_VERSION = "0.1.0"
 
 log = logging.getLogger("customer_mcp.server")
 _MAX_ECHO = 64
@@ -164,7 +164,7 @@ def build_server(settings: Settings, store: CustomerStore) -> Server:
 
     return Server(
         SERVER_NAME,
-        version=SERVER_VERSION,
+        version=__version__,
         on_list_tools=list_tools,
         on_call_tool=call_tool,
     )
