@@ -4,11 +4,15 @@ Only ``loc``, ``type`` and ``msg`` are used. ``input``, ``ctx`` and ``url`` are 
 surfaced, because arguments may contain customer PII.
 """
 
+import unicodedata
 from dataclasses import dataclass
 
 from pydantic import ValidationError
 
 from customer_mcp.config import CustomerIdCharset
+
+MAX_ECHO = 64  # cap for any client-supplied name echoed back or logged
+_MAX_ISSUES = 20
 
 _ID_HINTS: dict[CustomerIdCharset, str] = {
     "digits": "must look like CUST-XXXXX, where each X is a digit (e.g. CUST-00042)",
@@ -36,12 +40,26 @@ def _message(field: str, code: str, msg: str, charset: CustomerIdCharset) -> str
     return msg.removeprefix("Value error, ")
 
 
+def safe_name(name: str) -> str:
+    """Escape control/format characters and cap the length of a client-supplied name."""
+    escaped = "".join(
+        f"\\u{ord(c):04x}" if unicodedata.category(c) in ("Cc", "Cf") else c for c in name
+    )
+    return escaped if len(escaped) <= MAX_ECHO else escaped[:MAX_ECHO] + "…"
+
+
 def describe_validation_error(exc: ValidationError, charset: CustomerIdCharset) -> list[FieldIssue]:
+    errors = exc.errors(include_input=False, include_context=False, include_url=False)
     issues = []
-    for err in exc.errors(include_input=False, include_context=False, include_url=False):
-        field = ".".join(str(p) for p in err["loc"]) or "<arguments>"
+    for err in errors[:_MAX_ISSUES]:
+        raw_field = ".".join(str(p) for p in err["loc"]) or "<arguments>"
         code = err["type"]
-        issues.append(FieldIssue(field, code, _message(field, code, err["msg"], charset)))
+        # The message is chosen from the raw name; only the displayed name is escaped.
+        message = _message(raw_field, code, err["msg"], charset)
+        issues.append(FieldIssue(safe_name(raw_field), code, message))
+    if len(errors) > _MAX_ISSUES:
+        more = len(errors) - _MAX_ISSUES
+        issues.append(FieldIssue("<arguments>", "too_many_errors", f"… and {more} more"))
     return issues
 
 

@@ -125,3 +125,29 @@ def test_alnum_hint_wording():
     (issue,) = describe_validation_error(e.value, "alnum")
     assert "uppercase letter or digit" in issue.message
     assert "CUST-A1B2C" in issue.message
+
+
+def test_huge_extra_key_is_capped():
+    with pytest.raises(ValidationError) as e:
+        m.get_customer_record.model_validate({"customer_id": "CUST-00001", "k" * 10_000: 1})
+    issues = describe_validation_error(e.value, "digits")
+    assert all(len(i.field) <= 65 for i in issues)
+
+
+def test_extra_key_with_newline_is_escaped():
+    with pytest.raises(ValidationError) as e:
+        m.get_customer_record.model_validate({"customer_id": "CUST-00001", "a\nb\x00\u200b": 1})
+    issues = describe_validation_error(e.value, "digits")
+    assert all("\n" not in i.field and "\x00" not in i.field for i in issues)
+    rendered = render_issues("get_customer_record", issues)
+    assert len(rendered.splitlines()) == 1 + len(issues)  # no injected extra lines
+
+
+def test_issue_list_is_capped_at_20():
+    with pytest.raises(ValidationError) as e:
+        extras = {f"x{i}": 1 for i in range(50)}
+        m.get_customer_record.model_validate({"customer_id": "CUST-00001", **extras})
+    issues = describe_validation_error(e.value, "digits")
+    assert len(issues) == 21
+    assert issues[-1].code == "too_many_errors" and issues[-1].field == "<arguments>"
+    assert issues[-1].message.endswith("and 30 more")

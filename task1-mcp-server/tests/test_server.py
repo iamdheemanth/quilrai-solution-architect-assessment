@@ -146,3 +146,13 @@ async def test_unknown_tool_name_echo_is_truncated():
         with pytest.raises(MCPError) as e:
             await c.call_tool("a" * 500, {})
     assert e.value.message == "Unknown tool: " + "a" * 64 + chr(0x2026)
+
+
+async def test_invalid_call_emits_exactly_one_log_record(caplog):
+    caplog.set_level("DEBUG", logger="customer_mcp")
+    async with client() as c:
+        await c.call_tool("get_customer_record", {"customer_id": "bad", "junk": 1})
+    records = [r for r in caplog.records if r.name.startswith("customer_mcp")]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "outcome=invalid_args" in msg and "fields=" in msg

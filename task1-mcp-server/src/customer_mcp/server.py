@@ -20,12 +20,11 @@ from customer_mcp.schemas import (
     build_arg_models,
 )
 from customer_mcp.store import BusinessError, CustomerStore
-from customer_mcp.validation import describe_validation_error, render_issues
+from customer_mcp.validation import MAX_ECHO, describe_validation_error, render_issues
 
 SERVER_NAME = "customer-service-mcp"
 
 log = logging.getLogger("customer_mcp.server")
-_MAX_ECHO = 64
 
 
 @dataclass(frozen=True)
@@ -38,9 +37,9 @@ class _ToolSpec:
     run: Callable[[StrictArgs], BaseModel]
 
 
-def _log_call(name: str, outcome: str, started: float) -> None:
+def _log_call(name: str, outcome: str, started: float, extra: str = "") -> None:
     ms = int((time.perf_counter() - started) * 1000)
-    log.info("tool=%s outcome=%s duration_ms=%d", name, outcome, ms)
+    log.info("tool=%s outcome=%s%s duration_ms=%d", name, outcome, extra, ms)
 
 
 def build_server(settings: Settings, store: CustomerStore) -> Server:
@@ -128,15 +127,15 @@ def build_server(settings: Settings, store: CustomerStore) -> Server:
         if spec is None:
             # Client-controlled: never log the name (log forging); cap the wire echo.
             _log_call("<unknown>", "unknown_tool", started)
-            shown = name if len(name) <= _MAX_ECHO else name[:_MAX_ECHO] + "…"
+            shown = name if len(name) <= MAX_ECHO else name[:MAX_ECHO] + "…"
             raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {shown}")
 
         try:
             args = spec.args_model.model_validate(params.arguments or {})
         except ValidationError as exc:
             issues = describe_validation_error(exc, settings.customer_id_charset)
-            log.info("invalid arguments for %s: fields=%s", name, [i.field for i in issues])
-            _log_call(name, "invalid_args", started)
+            fields = f" fields={[i.field for i in issues]!r}"
+            _log_call(name, "invalid_args", started, fields)
             if settings.validation_errors == "protocol":
                 raise MCPError(
                     types.INVALID_PARAMS,
