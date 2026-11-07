@@ -64,7 +64,19 @@ def test_amount_rejects(amount):
         m.trigger_refund.model_validate({**VALID_REFUND, "amount": amount})
 
 
-@pytest.mark.parametrize("reason", ["too short", " " * 10, "  short   ", "x" * 501, 1234567890])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "too short",
+        " " * 10,
+        "  short   ",
+        "x" * 501,
+        1234567890,
+        "\x00" * 10,
+        "​" * 10,
+        "​" * 5 + "abcd",
+    ],
+)
 def test_reason_rejects(reason):
     with pytest.raises(ValidationError):
         m.trigger_refund.model_validate({**VALID_REFUND, "reason": reason})
@@ -73,6 +85,11 @@ def test_reason_rejects(reason):
 def test_reason_accepts_exactly_10_chars():
     model = m.trigger_refund.model_validate({**VALID_REFUND, "reason": "0123456789"})
     assert model.reason == "0123456789"
+
+
+def test_reason_accepts_embedded_tab_and_newline():
+    reason = "Duplicate\tcharge\non invoice"
+    assert m.trigger_refund.model_validate({**VALID_REFUND, "reason": reason}).reason == reason
 
 
 def test_extra_and_missing_fields_rejected():

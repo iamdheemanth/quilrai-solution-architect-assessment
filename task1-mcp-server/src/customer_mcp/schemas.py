@@ -1,5 +1,6 @@
 """Contract models: strict tool arguments and tool outputs."""
 
+import unicodedata
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
@@ -59,8 +60,12 @@ def build_arg_models(charset: CustomerIdCharset) -> ArgModels:
         @field_validator("reason")
         @classmethod
         def _not_blank(cls, v: str) -> str:
-            if len(v.strip()) < 10:
-                raise ValueError("must contain at least 10 characters after trimming whitespace")
+            visible = "".join(c for c in v if unicodedata.category(c) not in ("Cc", "Cf"))
+            if len(visible.strip()) < 10:
+                raise ValueError(
+                    "must contain at least 10 visible characters after trimming whitespace "
+                    "and control characters"
+                )
             return v
 
     return ArgModels(get_customer_record=GetCustomerRecordArgs, trigger_refund=TriggerRefundArgs)

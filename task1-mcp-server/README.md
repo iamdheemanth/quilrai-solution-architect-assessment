@@ -63,7 +63,7 @@ Moves money and is not idempotent: each successful call creates a new refund. An
 |---|---|
 | `customer_id` | same as above |
 | `amount` | JSON number, > 0, finite, at most 2 decimal places. JSON integers are accepted; strings and booleans are rejected |
-| `reason` | string of 10 to 500 characters, with at least 10 left after trimming whitespace |
+| `reason` | string of 10 to 500 characters, with at least 10 left after trimming whitespace and dropping control or zero-width (Unicode Cc/Cf) characters |
 
 Unknown fields are rejected on both tools (`additionalProperties: false` in the published schema, enforced server-side too). Missing or `null` `arguments` report the missing fields rather than crashing.
 
