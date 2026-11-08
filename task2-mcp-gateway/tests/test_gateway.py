@@ -289,10 +289,42 @@ async def test_oversized_body_413_and_large_legit_body_forwarded():
 
 
 @pytest.mark.parametrize("path", ["/mcp/", "/MCP", "/other", "//mcp"])
-async def test_other_paths_404(path):
+async def test_other_paths_404(path, caplog):
+    caplog.set_level(logging.INFO, logger="mcp_gateway.audit")
     async with gateway() as (c, calls):
         r = await c.post(path, content=rpc("tools/list"), headers=headers("admin"))
     assert r.status_code == 404
+    assert r.headers["content-type"] == "application/json"
+    assert r.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "Not Found"},
+    }
+    assert calls == []
+    records = _audit_records(caplog)
+    assert [(x["decision"], x["reason"]) for x in records] == [("reject", "unknown_path")]
+
+
+@pytest.mark.parametrize("method", ["HEAD", "PUT", "PATCH", "OPTIONS", "BREW"])
+async def test_other_methods_405_json_and_audited(method, caplog):
+    caplog.set_level(logging.INFO, logger="mcp_gateway.audit")
+    async with gateway() as (c, calls):
+        r = await c.request(method, "/mcp", headers=headers("admin"))
+    assert r.status_code == 405
+    assert r.headers["allow"] == "POST, GET, DELETE"
+    assert r.headers["content-type"] == "application/json"
+    if method != "HEAD":
+        assert r.json()["error"] == {"code": -32600, "message": "Method Not Allowed"}
+    assert calls == []
+    records = _audit_records(caplog)
+    assert [(x["decision"], x["reason"]) for x in records] == [("reject", "method_not_allowed")]
+    assert records[0]["upstream_contacted"] is False
+
+
+async def test_unauthenticated_head_is_401():
+    async with gateway() as (c, calls):
+        r = await c.head("/mcp", headers=headers(None))
+    assert r.status_code == 401
     assert calls == []
 
 

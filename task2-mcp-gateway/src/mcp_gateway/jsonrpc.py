@@ -162,9 +162,7 @@ def parse_message(body: bytes) -> RpcMessage:
     return classify(parsed)
 
 
-def error_body(
-    rpc_id: RpcId | None, code: int, message: str, data: dict | None = None
-) -> bytes:
+def error_body(rpc_id: RpcId | None, code: int, message: str, data: dict | None = None) -> bytes:
     error: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
         error["data"] = data

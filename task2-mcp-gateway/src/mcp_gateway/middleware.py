@@ -128,11 +128,16 @@ class JsonRpcPolicyMiddleware:
             await self.app(scope, receive, send)
             return
         if scope["path"] != MCP_PATH:  # exact path only: no redirects, never forwarded
-            await send_json(send, 404, b'{"detail":"Not Found"}')
+            self._audit(scope, "reject", "unknown_path")
+            await send_json(send, 404, error_body(None, INVALID_REQUEST, "Not Found"))
             return
-        if scope["method"] != "POST":
-            if scope["method"] in ("GET", "DELETE"):  # legacy stream / session end
-                self._audit(scope, "allow", "legacy_passthrough", contacted=True)
+        if scope["method"] not in ("POST", "GET", "DELETE"):  # incl. Starlette's implicit HEAD
+            self._audit(scope, "reject", "method_not_allowed")
+            body = error_body(None, INVALID_REQUEST, "Method Not Allowed")
+            await send_json(send, 405, body, [(b"allow", b"POST, GET, DELETE")])
+            return
+        if scope["method"] != "POST":  # legacy stream / session end
+            self._audit(scope, "allow", "legacy_passthrough", contacted=True)
             await self.app(scope, receive, send)
             return
         if not _supported_content_type(scope["headers"]):
