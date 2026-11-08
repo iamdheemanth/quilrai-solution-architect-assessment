@@ -2,6 +2,8 @@
 
 import json
 
+import httpx2
+
 from llm_gateway.sse import SSEEvent, SSEParser
 
 ENV = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1700000000, "model": "m"}
@@ -69,3 +71,21 @@ def run(tx, *frames: bytes) -> bytes:
 def parse_out(raw: bytes) -> list:
     """Parse output bytes into JSON objects (or the string '[DONE]')."""
     return [json.loads(e.data) if e.data != "[DONE]" else "[DONE]" for e in events(raw)]
+
+
+class StreamBody(httpx2.AsyncByteStream):
+    """Unread response stream (a prebuilt Response is already consumed); optionally fails."""
+
+    def __init__(self, parts: list[bytes], error: Exception | None = None) -> None:
+        self._parts = parts
+        self._error = error
+        self.closed = False
+
+    async def __aiter__(self):
+        for part in self._parts:
+            yield part
+        if self._error is not None:
+            raise self._error
+
+    async def aclose(self) -> None:
+        self.closed = True
