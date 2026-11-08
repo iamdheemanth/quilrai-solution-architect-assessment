@@ -27,10 +27,10 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8000
     auth_mode: AuthMode = "jwt"
-    jwt_secret: str = ""
+    jwt_secret: str = field(default="", repr=False)
     jwt_audience: str = "mcp-gateway"
     jwt_issuer: str = "mcp-gateway-dev"
-    static_tokens: Mapping[str, Role] = field(default_factory=dict)
+    static_tokens: Mapping[str, Role] = field(default_factory=dict, repr=False)
     deny_http_status: Literal[200, 403] = 200
     max_body_bytes: int = 4 * 1024 * 1024
     log_level: str = "INFO"

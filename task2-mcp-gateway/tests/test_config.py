@@ -77,3 +77,22 @@ def test_errors_never_leak_token_values():
 def test_deny_status_403_opt_in():
     s = load_settings({"GATEWAY_JWT_SECRET": SECRET, "GATEWAY_DENY_HTTP_STATUS": "403"})
     assert s.deny_http_status == 403
+
+
+def test_repr_hides_jwt_secret():
+    s = load_settings({"GATEWAY_JWT_SECRET": SECRET})
+    assert SECRET not in repr(s)
+    assert "downstream_url" in repr(s)
+
+
+def test_repr_hides_static_tokens():
+    s = load_settings(
+        {
+            "GATEWAY_AUTH_MODE": "static",
+            "GATEWAY_STATIC_TOKENS": "tok-admin-1=admin,tok-view-1=viewer",
+        }
+    )
+    text = repr(s)
+    assert "tok-admin-1" not in text
+    assert "tok-view-1" not in text
+    assert "auth_mode" in text
