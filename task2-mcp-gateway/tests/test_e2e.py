@@ -35,38 +35,46 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def start(app) -> tuple[uvicorn.Server, threading.Thread, int]:
+def start(app, started: list) -> int:
+    """Run ``app`` under uvicorn in a thread; register it in ``started`` before waiting."""
     port = free_port()
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on")
     )
     thread = threading.Thread(target=server.run, daemon=True)
+    started.append((server, thread))
     thread.start()
     deadline = time.monotonic() + 10
     while not server.started:
         if time.monotonic() > deadline or not thread.is_alive():
             raise RuntimeError("uvicorn server did not start")
         time.sleep(0.05)
-    return server, thread, port
+    return port
 
 
 @pytest.fixture(scope="module")
 def stack():
-    mock = build_mock(json_response=False)
-    mock_server, mock_thread, mock_port = start(mock.app)
-    settings = load_settings(
-        {
-            "GATEWAY_JWT_SECRET": TEST_SECRET,
-            "GATEWAY_DOWNSTREAM_URL": f"http://127.0.0.1:{mock_port}/mcp",
-        }
-    )
-    gw_server, gw_thread, gw_port = start(create_app(settings))
+    started: list[tuple[uvicorn.Server, threading.Thread]] = []
     try:
+        mock = build_mock(json_response=False)
+        mock_port = start(mock.app, started)
+        settings = load_settings(
+            {
+                "GATEWAY_JWT_SECRET": TEST_SECRET,
+                "GATEWAY_DOWNSTREAM_URL": f"http://127.0.0.1:{mock_port}/mcp",
+            }
+        )
+        gw_port = start(create_app(settings), started)
         yield f"http://127.0.0.1:{gw_port}/mcp", mock
     finally:
-        for server, thread in ((gw_server, gw_thread), (mock_server, mock_thread)):
+        for server, _ in started:
             server.should_exit = True
+        hung = []
+        for _server, thread in reversed(started):
             thread.join(timeout=10)
+            if thread.is_alive():
+                hung.append(thread.name)
+        assert not hung, f"uvicorn thread(s) still alive after shutdown: {hung}"
 
 
 def sdk_client(url: str, role: str, mode: str):
@@ -110,10 +118,15 @@ async def test_viewer_allowed_tool_ok_and_admin_tool_denied(stack, mode):
     assert mock.calls["admin_reset_key"] == before
 
 
+def minimal_env(**extra: str) -> dict[str, str]:
+    keep = ("PATH", "SYSTEMROOT", "TEMP", "TMP")
+    return {k: os.environ[k] for k in keep if k in os.environ} | extra
+
+
 def test_main_refuses_short_secret():
     proc = subprocess.run(
         [sys.executable, "-m", "mcp_gateway"],
-        env={**os.environ, "GATEWAY_JWT_SECRET": "short"},
+        env=minimal_env(GATEWAY_JWT_SECRET="short"),
         capture_output=True,
         timeout=30,
     )
