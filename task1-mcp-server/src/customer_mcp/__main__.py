@@ -6,20 +6,14 @@ import logging
 import sys
 
 import anyio
-from mcp.server.lowlevel import Server
-from mcp.server.stdio import stdio_server
 
 from customer_mcp import __version__
 from customer_mcp.config import ConfigError, load_settings
 from customer_mcp.server import build_server
 from customer_mcp.store import CustomerStore
+from customer_mcp.transport import serve_stdio
 
 log = logging.getLogger("customer_mcp.main")
-
-
-async def _serve(server: Server) -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
 def main() -> None:
@@ -43,7 +37,7 @@ def main() -> None:
         settings.customer_id_charset,
     )
     server = build_server(settings, CustomerStore.seeded())
-    anyio.run(_serve, server)
+    anyio.run(serve_stdio, server)
 
 
 if __name__ == "__main__":

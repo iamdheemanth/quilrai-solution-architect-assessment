@@ -60,10 +60,13 @@ async def test_trigger_refund_success(caplog):
     assert "tool=trigger_refund outcome=ok duration_ms=" in caplog.text
 
 
+TOOL_MODE = Settings(validation_errors="tool")
+
+
 async def test_invalid_args_tool_mode_returns_is_error_with_fields(caplog):
     caplog.set_level("INFO", logger="customer_mcp")
     bad = {"customer_id": "CUST-1", "amount": "50", "reason": "short", "junk": 1}
-    async with client() as c:
+    async with client(TOOL_MODE) as c:
         res = await c.call_tool("trigger_refund", bad)
     assert res.is_error is True and res.structured_content is None
     for field in ("customer_id", "amount", "reason", "junk"):
@@ -72,15 +75,23 @@ async def test_invalid_args_tool_mode_returns_is_error_with_fields(caplog):
 
 
 async def test_missing_arguments_reports_required_fields():
-    async with client() as c:
+    async with client(TOOL_MODE) as c:
         res = await c.call_tool("trigger_refund", None)
     assert res.is_error is True
     for field in ("customer_id", "amount", "reason"):
         assert field in res.content[0].text
 
 
-async def test_invalid_args_protocol_mode_raises_32602_with_data():
-    async with client(Settings(validation_errors="protocol")) as c:
+async def test_missing_arguments_default_mode_is_32602():
+    async with client() as c:
+        with pytest.raises(MCPError) as e:
+            await c.call_tool("trigger_refund", None)
+    assert e.value.code == -32602
+    assert {i["field"] for i in e.value.data["errors"]} == {"customer_id", "amount", "reason"}
+
+
+async def test_invalid_args_default_mode_raises_32602_with_data():
+    async with client() as c:  # default settings: protocol mode, as the brief requires
         with pytest.raises(MCPError) as e:
             await c.call_tool("get_customer_record", {"customer_id": "nope"})
     assert e.value.code == -32602
@@ -148,10 +159,15 @@ async def test_unknown_tool_name_echo_is_truncated():
     assert e.value.message == "Unknown tool: " + "a" * 64 + chr(0x2026)
 
 
-async def test_invalid_call_emits_exactly_one_log_record(caplog):
+@pytest.mark.parametrize("mode", ["tool", "protocol"])
+async def test_invalid_call_emits_exactly_one_log_record(caplog, mode):
     caplog.set_level("DEBUG", logger="customer_mcp")
-    async with client() as c:
-        await c.call_tool("get_customer_record", {"customer_id": "bad", "junk": 1})
+    async with client(Settings(validation_errors=mode)) as c:
+        if mode == "protocol":
+            with pytest.raises(MCPError):
+                await c.call_tool("get_customer_record", {"customer_id": "bad", "junk": 1})
+        else:
+            await c.call_tool("get_customer_record", {"customer_id": "bad", "junk": 1})
     records = [r for r in caplog.records if r.name.startswith("customer_mcp")]
     assert len(records) == 1
     msg = records[0].getMessage()

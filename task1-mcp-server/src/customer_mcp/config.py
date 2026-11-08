@@ -21,7 +21,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    validation_errors: ValidationErrorMode = "tool"
+    validation_errors: ValidationErrorMode = "protocol"
     customer_id_charset: CustomerIdCharset = "digits"
     log_level: str = "INFO"
 
@@ -41,7 +41,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     if env is None:
         env = os.environ
     return Settings(
-        validation_errors=_read(env, "MCP_VALIDATION_ERRORS", "tool", _VALIDATION_MODES, False),
+        validation_errors=_read(
+            env, "MCP_VALIDATION_ERRORS", "protocol", _VALIDATION_MODES, False
+        ),
         customer_id_charset=_read(env, "CUSTOMER_ID_CHARSET", "digits", _CHARSETS, False),
         log_level=_read(env, "LOG_LEVEL", "INFO", _LOG_LEVELS, True),
     )

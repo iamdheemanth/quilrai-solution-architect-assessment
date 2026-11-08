@@ -74,25 +74,28 @@ def test_notification_gets_no_response(s):
     assert len(s.stdout_lines) == 2  # initialize + tools/list, nothing for the notification
 
 
-@pytest.mark.parametrize(
-    "args,field",
-    [
-        ({"customer_id": "CUST-00001\n"}, "customer_id"),
-        ({"customer_id": 12345}, "customer_id"),
-        ({}, "customer_id"),
-    ],
-)
-def test_bad_args_return_is_error_result(s, args, field):
+BAD_ARGS = [
+    {"customer_id": "CUST-00001\n"},
+    {"customer_id": 12345},
+    {},
+]
+
+
+@pytest.mark.parametrize("args", BAD_ARGS)
+def test_default_mode_bad_args_return_32602(s, args):
+    s.initialize()
+    resp = s.request("tools/call", {"name": "get_customer_record", "arguments": args})
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == "Invalid arguments for tool get_customer_record"
+    assert [e["field"] for e in resp["error"]["data"]["errors"]] == ["customer_id"]
+
+
+@pytest.mark.parametrize("args", BAD_ARGS)
+def test_tool_mode_bad_args_return_is_error_result(make_session, args):
+    s = make_session({"MCP_VALIDATION_ERRORS": "tool"})
     s.initialize()
     r = s.request("tools/call", {"name": "get_customer_record", "arguments": args})["result"]
-    assert r["isError"] is True and field in r["content"][0]["text"]
-
-
-def test_protocol_mode_bad_args_return_32602(make_session):
-    s = make_session({"MCP_VALIDATION_ERRORS": "protocol"})
-    s.initialize()
-    resp = s.request("tools/call", {"name": "get_customer_record", "arguments": {}})
-    assert resp["error"]["code"] == -32602
+    assert r["isError"] is True and "customer_id" in r["content"][0]["text"]
 
 
 def test_unknown_tool_32602(s):
@@ -107,15 +110,27 @@ def test_unknown_method_32601(s):
     assert s.request("foo/bar")["error"]["code"] == -32601
 
 
-def test_junk_input_does_not_break_server(s):
+def test_junk_input_gets_jsonrpc_errors_and_server_keeps_serving(s):
     s.initialize()
     s.send("this is not json")
-    s.send("[1, 2]")
+    s.send("[1, 2]")  # batches were removed from MCP in 2025-06-18
     assert s.request("tools/list")["result"]["tools"]  # still serving
     s.close()
-    # SDK 2.3.0 drops both junk lines silently; the only replies are initialize and tools/list.
     replies = [json.loads(line) for line in s.stdout_lines]
-    assert [r["id"] for r in replies] == [1, 2]
+    assert [r["id"] for r in replies] == [1, None, None, 2]
+    assert replies[1]["error"] == {"code": -32700, "message": "Parse error"}
+    assert replies[2]["error"] == {"code": -32600, "message": "Invalid Request"}
+    assert "this is not json" not in s.stderr_text  # the raw line is never logged
+
+
+def test_wrong_type_params_get_invalid_request(s):
+    s.initialize()
+    s.send({"jsonrpc": "2.0", "id": 77, "method": "tools/call", "params": [1]})
+    assert s.request("tools/list")["result"]["tools"]  # still serving
+    s.close()
+    replies = [json.loads(line) for line in s.stdout_lines]
+    invalid_request = {"code": -32600, "message": "Invalid Request"}
+    assert {"jsonrpc": "2.0", "id": None, "error": invalid_request} in replies
 
 
 def test_malformed_tools_call_arguments_is_32602(s):

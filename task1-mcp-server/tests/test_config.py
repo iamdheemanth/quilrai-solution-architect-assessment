@@ -4,18 +4,19 @@ from customer_mcp.config import ConfigError, Settings, load_settings
 
 
 def test_defaults_when_env_empty():
-    assert load_settings({}) == Settings("tool", "digits", "INFO")
+    assert load_settings({}) == Settings("protocol", "digits", "INFO")
+    assert Settings() == Settings("protocol", "digits", "INFO")
 
 
 def test_reads_and_normalises_values():
     s = load_settings(
         {
-            "MCP_VALIDATION_ERRORS": "Protocol",
+            "MCP_VALIDATION_ERRORS": "Tool",
             "CUSTOMER_ID_CHARSET": "ALNUM",
             "LOG_LEVEL": "debug",
         }
     )
-    assert s == Settings("protocol", "alnum", "DEBUG")
+    assert s == Settings("tool", "alnum", "DEBUG")
 
 
 @pytest.mark.parametrize(

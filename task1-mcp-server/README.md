@@ -2,7 +2,7 @@
 
 ## What it is
 
-A Python MCP server that talks JSON-RPC over stdio and exposes two tools against an in-memory customer database: `get_customer_record` (read-only lookup) and `trigger_refund` (moves money). It is built on the official `mcp` SDK (2.3.x) using the low-level `Server`, with strict Pydantic validation at the tool boundary. stdout carries JSON-RPC only; all logs go to stderr. Error handling follows the MCP 2025-11-25 tools spec, with a switch for the stricter protocol-level reading (see [Error policy](#error-policy)).
+A Python MCP server that talks JSON-RPC over stdio and exposes two tools against an in-memory customer database: `get_customer_record` (read-only lookup) and `trigger_refund` (moves money). It is built on the official `mcp` SDK (2.3.x) using the low-level `Server`, with strict Pydantic validation at the tool boundary. stdout carries JSON-RPC only; all logs go to stderr. Invalid input is rejected with standard JSON-RPC error codes (`-32602` for bad arguments, `-32700`/`-32600` for unparseable messages), as the brief requires, with a switch to the MCP 2025-11-25 tool-error style (see [Error policy](#error-policy)).
 
 ## Quick start
 
@@ -11,16 +11,16 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                  # install dependencies
 uv run customer-mcp      # run the server on stdio (waits for JSON-RPC on stdin)
-uv run pytest -v         # 93 tests, about 10 s (many spawn the server as a subprocess)
+uv run pytest -v         # 104 tests, about 13 s (many spawn the server as a subprocess)
 ```
 
-Protocol-error mode (`-32602` for invalid arguments) instead of the default `isError` results:
+Tool-error mode (`isError: true` results for invalid arguments, the MCP 2025-11-25 recommendation) instead of the default `-32602`:
 
 ```bash
-MCP_VALIDATION_ERRORS=protocol uv run customer-mcp                      # bash
+MCP_VALIDATION_ERRORS=tool uv run customer-mcp                      # bash
 ```
 ```powershell
-$env:MCP_VALIDATION_ERRORS="protocol"; uv run customer-mcp   # PowerShell
+$env:MCP_VALIDATION_ERRORS="tool"; uv run customer-mcp   # PowerShell
 ```
 
 Smoke test with the MCP Inspector CLI (needs Node):
@@ -42,7 +42,7 @@ The Inspector's `--tool-arg` coerces argument types (everything on the command l
       "command": "uv",
       "args": ["--directory", "/absolute/path/to/task1-mcp-server", "run", "customer-mcp"],
       "env": {
-        "MCP_VALIDATION_ERRORS": "tool",
+        "MCP_VALIDATION_ERRORS": "protocol",
         "CUSTOMER_ID_CHARSET": "digits"
       }
     }
@@ -97,7 +97,7 @@ Read once at startup, case-insensitively. An invalid value prints a message to s
 
 | Variable | Values | Default | Effect |
 |---|---|---|---|
-| `MCP_VALIDATION_ERRORS` | `tool`, `protocol` | `tool` | How argument-validation failures are reported (see below) |
+| `MCP_VALIDATION_ERRORS` | `protocol`, `tool` | `protocol` | How argument-validation failures are reported (see below) |
 | `CUSTOMER_ID_CHARSET` | `digits`, `alnum` | `digits` | `^CUST-[0-9]{5}$` or `^CUST-[A-Z0-9]{5}$` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` | stderr log level |
 
@@ -105,20 +105,23 @@ Read once at startup, case-insensitively. An invalid value prints a message to s
 
 | Situation | Response |
 |---|---|
+| Line that is not valid JSON | JSON-RPC error `-32700` `"Parse error"`, `id: null` |
+| Valid JSON that is not a JSON-RPC message (batch array, `params` of the wrong type, non-string `method`) | JSON-RPC error `-32600` `"Invalid Request"`, `id: null` |
+| Unknown method | JSON-RPC error `-32601` (SDK) |
+| Malformed `tools/call` envelope (`arguments` not an object, `name` missing or not a string, `params` omitted) | JSON-RPC error `-32602` `"Invalid request parameters"` (SDK) |
 | Unknown tool name | JSON-RPC error `-32602`, `"Unknown tool: <name>"` (both modes; name truncated to 64 chars) |
-| Arguments fail a tool's rules, mode `tool` (default) | Result with `isError: true`; text lists each bad field; no `structuredContent` |
-| Arguments fail a tool's rules, mode `protocol` | JSON-RPC error `-32602`, `"Invalid arguments for tool <name>"`, `data: {"errors": [{field, code, message}, ...]}` |
+| Arguments fail a tool's rules, mode `protocol` (default) | JSON-RPC error `-32602`, `"Invalid arguments for tool <name>"`, `data: {"errors": [{field, code, message}, ...]}` |
+| Arguments fail a tool's rules, mode `tool` | Result with `isError: true`; text lists each bad field; no `structuredContent` |
 | Business rule: customer not found, account suspended, amount over balance | Result with `isError: true` and a readable message |
 | Unexpected exception | JSON-RPC error `-32603`, `"Internal error"`; traceback goes to stderr only |
-| Parse errors, unknown methods, malformed `tools/call` envelope, requests before `initialize` | Left to the SDK (see [Observed SDK behaviour](#observed-sdk-behaviour)) |
 
-Error messages name the offending fields and never echo rejected argument values or the `reason`; unknown tool names and unrecognised argument names are echoed back escaped and truncated to 64 characters. Logs record field names only (same escaping and cap), folded into the single outcome line of the call.
+Error messages name the offending fields and never echo rejected argument values or the `reason`; unknown tool names and unrecognised argument names are echoed back escaped and truncated to 64 characters. Logs record field names only (same escaping and cap), folded into the single outcome line of the call. Rejected unparseable lines are never logged.
 
-### Why `isError` and not `-32602` by default
+### Why `-32602` by default, and what `tool` mode is for
 
-MCP 2025-11-25 ([Tools, Error Handling](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) limits protocol errors to unknown tools, requests that fail the `CallToolRequest` schema, and server errors. "Input validation errors (e.g., date in wrong format, value out of range)" are to be returned as tool execution errors with `isError: true`. This resolved an ambiguity in 2025-06-18 via [SEP-1303](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1303); the 2026-07-28 revision keeps the classification. The rationale is that the model can see a tool result and self-correct, but typically cannot see a JSON-RPC error. A malformed `customer_id` and an out-of-range `amount` are exactly the spec's own examples, so `tool` mode is the default. Both official SDKs' high-level APIs behave the same way.
+The brief asks for invalid formats to be rejected "with standard MCP JSON-RPC error codes", so the default answers a schema violation with `-32602 Invalid params` and a machine-readable field list in `error.data`. Business outcomes (unknown customer, suspended account, amount over balance) are not malformed input, so they stay tool results with `isError: true` in both modes.
 
-Setting `MCP_VALIDATION_ERRORS=protocol` gives the literal "invalid params means `-32602`" behaviour, with a machine-readable field list in `error.data`. The spec language here is guidance, so this is a legitimate choice, but it has a cost: clients only MAY pass protocol errors to the model, so a model may never see the validation message. Business outcomes stay `isError: true` in both modes.
+MCP 2025-11-25 ([Tools, Error Handling](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) recommends a different split: protocol errors only for unknown tools, requests that fail the `CallToolRequest` schema, and server errors, while "input validation errors (e.g., date in wrong format, value out of range)" SHOULD be returned as tool execution errors with `isError: true`. This resolved an ambiguity in 2025-06-18 via [SEP-1303](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1303), and the 2026-07-28 revision keeps it. The rationale is that the model sees a tool result and can self-correct, while clients only MAY pass a JSON-RPC error on to the model. `MCP_VALIDATION_ERRORS=tool` gives exactly that behaviour; it is what the official SDKs' high-level APIs do by default. The two modes differ only in how a failed argument check is reported; validation itself is identical.
 
 ## STDIO isolation
 
@@ -132,26 +135,27 @@ The stdio transport requires that the server "MUST NOT write anything to its std
 
 Proof is black-box: `tests/test_stdio.py` spawns the real server, speaks raw newline-delimited JSON-RPC, and asserts that every stdout line is valid UTF-8 and parses as JSON-RPC, that logs appear only on stderr, and that malformed input does not break the session. `test_stray_prints_cannot_corrupt_stdout` runs the server with a handler that calls `print("STRAY-PRINT")` and `os.write(1, b"STRAY-OSWRITE\n")`: the tool call still succeeds, neither string appears on stdout, and both appear on stderr, which demonstrates the fd-1 diversion directly.
 
-## Observed SDK behaviour
+## Malformed input on the wire
 
-Recorded by the stdio harness on `mcp` 2.3.0; the server adds no handling for these cases.
+Every case below is exercised by `tests/test_stdio.py` against the real process; in all of them the server keeps serving.
 
-| Input | Result |
-|---|---|
-| Non-JSON line after `initialize` | No reply, no stderr output at INFO; server keeps serving (see note below) |
-| JSON array (batch), e.g. `[1, 2]` | No reply; server keeps serving |
-| `tools/call` with `arguments` as a string or array, `name` missing or not a string, or `params` omitted | Error `-32602` `"Invalid request parameters"`; server keeps serving |
-| `tools/call` with `params` as an array or string, with an id | No reply (the SDK drops the line at DEBUG); the client times out |
-| Request before `initialize` | Error `-32602` `"Invalid request parameters"`; a later `initialize` and requests work normally |
-| Unknown method | Error `-32601` |
-| Notification | No response |
-| stdin EOF | Process exits with code 0 |
+| Input | Result | Produced by |
+|---|---|---|
+| Non-JSON line | `-32700` `"Parse error"`, `id: null` | `transport.py` |
+| JSON array (batch), e.g. `[1, 2]` | `-32600` `"Invalid Request"`, `id: null` (batching was removed from MCP in 2025-06-18) | `transport.py` |
+| Request whose `params` is an array or string | `-32600` `"Invalid Request"`, `id: null` | `transport.py` |
+| `tools/call` with `arguments` as a string or array, `name` missing or not a string, or `params` omitted | `-32602` `"Invalid request parameters"` | SDK |
+| Request before `initialize` | `-32602` `"Invalid request parameters"`; a later `initialize` and requests work normally | SDK |
+| Unknown method | `-32601` | SDK |
+| Notification | No response | SDK |
+| stdin EOF | Process exits with code 0 | SDK |
 
-The silent drops (non-JSON lines, and `params` of the wrong type on a request with an id) deviate from JSON-RPC 2.0 section 5, which expects `-32700` or `-32600` with `id: null`. This is SDK 2.3.0 behaviour that the server leaves alone: the SDK owns the read stream (`create_context_streams`), and replacing it is riskier than the deviation.
+Why `transport.py` exists: SDK 2.3.0's stdio reader turns a line it cannot parse into an exception item and the dispatcher drops it, so the client would get no reply and wait until it timed out. JSON-RPC 2.0 section 5 requires `-32700` for invalid JSON and `-32600` for an invalid request object, with `id: null` when the id cannot be determined. `transport.py` wraps the SDK's `stdio_server()` (keeping its fd-level stdout protection) and puts a small filter between the reader and the server: parse failures are answered with the right code, and everything else is passed through untouched. It relies only on the SDK's public stream protocol, and the rejected line is never logged.
 
 ## Design notes
 
-- **Low-level `Server`, not the high-level `MCPServer`.** The high-level layer builds its input model from the function signature: it coerces `"100"` to `100.0` and ignores unknown keys, which defeats the strictness requirements. Here `tools/list` and `tools/call` are registered by hand and arguments go through Pydantic models with `strict=True, extra="forbid"`.
+- **Low-level `Server`, not the high-level `MCPServer`.** The high-level layer builds its input model from the function signature: it coerces `"100"` to `100.0` and ignores unknown keys, which defeats the strictness requirements. It also turns every argument failure into an `isError` result, so it cannot produce `-32602` for bad input. Here `tools/list` and `tools/call` are registered by hand and arguments go through Pydantic models with `strict=True, extra="forbid"`.
+- **Module layout.** `config.py` (environment settings), `schemas.py` (strict argument and output models), `validation.py` (non-leaking error messages), `store.py` (in-memory customers and refund rules), `server.py` (tool registry and error mapping), `transport.py` (stdio with JSON-RPC parse errors), `__main__.py` (logging setup and startup).
 - **`Decimal` for money.** Balances are held as `Decimal` quantized to cents, so repeated refunds don't accumulate float error. Floats appear only at the JSON boundary.
 - **Annotations.** `get_customer_record` is marked read-only and idempotent; `trigger_refund` is marked destructive and non-idempotent so clients can gate it behind confirmation.
 - **No idempotency key.** The brief specifies three inputs, so a retried `trigger_refund` issues a second refund. A production version would add an optional `idempotency_key` argument, store `key -> receipt`, and return the stored receipt on replay (rejecting a replay whose amount or customer differs).
@@ -159,11 +163,11 @@ The silent drops (non-JSON lines, and `params` of the wrong type on a request wi
 
 ## Spec versions
 
-Built for MCP 2025-11-25 (handshake-based) on `mcp` 2.3.x; the test harness negotiates `2025-11-25`. Revision 2026-07-28 redesigns the protocol to be stateless (no `initialize` handshake, per-request version and capabilities, `server/discover`). The behaviours that matter here (error classification, stdout purity, exit on stdin EOF) are unchanged by it, but this project was exercised only with the 2025-11-25 handshake flow.
+Built for MCP 2025-11-25 (handshake-based) on `mcp` 2.3.x; the test harness negotiates `2025-11-25`. Revision 2026-07-28 redesigns the protocol to be stateless (no `initialize` handshake, per-request version and capabilities, `server/discover`). The behaviours that matter here (error codes, stdout purity, exit on stdin EOF) are unchanged by it, but this project was exercised only with the 2025-11-25 handshake flow.
 
 ## Evidence: test suite
 
-`uv sync --locked && uv run ruff check . && uv run pytest -v` gives `All checks passed!` and `93 passed`. Test names from `uv run pytest --collect-only -q`, with parametrized cases abbreviated:
+`uv sync --locked && uv run ruff check . && uv run pytest -v` gives `All checks passed!` and `104 passed`. Test names from `uv run pytest --collect-only -q`, with parametrized cases abbreviated:
 
 ```
 tests/test_config.py
@@ -197,23 +201,25 @@ tests/test_server.py
   test_trigger_refund_success
   test_invalid_args_tool_mode_returns_is_error_with_fields
   test_missing_arguments_reports_required_fields
-  test_invalid_args_protocol_mode_raises_32602_with_data
+  test_missing_arguments_default_mode_is_32602
+  test_invalid_args_default_mode_raises_32602_with_data
   test_unknown_tool_is_32602_in_both_modes[tool | protocol]
   test_business_error_is_tool_error
   test_alnum_mode_accepts_letter_ids
   test_unexpected_exception_is_32603_without_leak
   test_unknown_tool_name_is_never_logged_raw
   test_unknown_tool_name_echo_is_truncated
-  test_invalid_call_emits_exactly_one_log_record
+  test_invalid_call_emits_exactly_one_log_record[tool | protocol]
 
 tests/test_stdio.py
   test_handshake_and_tools_list
   test_notification_gets_no_response
-  test_bad_args_return_is_error_result[3 cases]
-  test_protocol_mode_bad_args_return_32602
+  test_default_mode_bad_args_return_32602[3 cases]
+  test_tool_mode_bad_args_return_is_error_result[3 cases]
   test_unknown_tool_32602
   test_unknown_method_32601
-  test_junk_input_does_not_break_server
+  test_junk_input_gets_jsonrpc_errors_and_server_keeps_serving
+  test_wrong_type_params_get_invalid_request
   test_malformed_tools_call_arguments_is_32602
   test_stray_prints_cannot_corrupt_stdout
   test_request_before_initialize_does_not_break_server
@@ -238,5 +244,10 @@ tests/test_store.py
   test_seeded_stores_are_independent
   test_huge_amount_rejected_as_business_error[1e+30 | 1e+300]
 
-93 passed
+tests/test_transport.py
+  test_invalid_json_is_parse_error
+  test_valid_json_that_is_not_a_message_is_invalid_request[4 cases]
+  test_unexpected_exception_type_is_invalid_request
+
+104 passed
 ```
