@@ -83,6 +83,14 @@ def test_unknown_method_denied(era, status, method):
     assert ei.value.reason == "unknown_method"
 
 
+def test_unknown_method_notification_is_400_in_both_eras():
+    for era in ("legacy", "modern"):
+        with pytest.raises(RpcReject) as ei:
+            authorize(RpcMessage("notification", "admin/reset", None, {}), VIEWER, S, era)
+        assert (ei.value.http_status, ei.value.code, ei.value.rpc_id) == (400, -32601, None)
+        assert ei.value.reason == "unknown_method"
+
+
 def test_notifications_prefix_allowed():
     msg = RpcMessage("notification", "notifications/initialized", None, None)
     assert authorize(msg, VIEWER, S, "legacy").allowed
@@ -138,14 +146,30 @@ def test_mirrored_header_bad_params_is_mismatch():
         check_mirrored_headers(hdrs(mcp_name="x"), msg)
 
 
-def test_protocol_era():
-    assert protocol_era([]) == "legacy"
-    assert protocol_era(hdrs(mcp_protocol_version="2025-11-25")) == "legacy"
-    assert protocol_era(hdrs(mcp_protocol_version="2026-07-28")) == "modern"
-    assert protocol_era(hdrs(mcp_protocol_version="2027-01-01")) == "modern"
-    assert protocol_era([(b"mcp-protocol-version", b"\xff")]) == "legacy"
-    dup = hdrs(mcp_protocol_version="2026-07-28") * 2
-    assert protocol_era(dup) == "legacy"
+@pytest.mark.parametrize(
+    ("headers", "era"),
+    [
+        ([], "legacy"),
+        (hdrs(mcp_protocol_version="2025-11-25"), "legacy"),
+        (hdrs(mcp_protocol_version="2025-06-18"), "legacy"),
+        (hdrs(mcp_protocol_version="2026-07-28"), "modern"),
+        # The SDK treats any value outside HANDSHAKE_PROTOCOL_VERSIONS as modern.
+        (hdrs(mcp_protocol_version="2025-01-01"), "modern"),
+        (hdrs(mcp_protocol_version="2027-01-01"), "modern"),
+        ([(b"mcp-protocol-version", b"\xff")], "modern"),
+        # Only the first header value counts, as in the SDK.
+        (
+            hdrs(mcp_protocol_version="2026-07-28") + hdrs(mcp_protocol_version="2025-11-25"),
+            "modern",
+        ),
+        (
+            hdrs(mcp_protocol_version="2025-11-25") + hdrs(mcp_protocol_version="2026-07-28"),
+            "legacy",
+        ),
+    ],
+)
+def test_protocol_era(headers, era):
+    assert protocol_era(headers) == era
 
 
 def test_audit_event_is_single_escaped_json_line(caplog):

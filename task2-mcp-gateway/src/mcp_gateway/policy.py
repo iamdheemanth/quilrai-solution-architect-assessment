@@ -7,6 +7,7 @@ from typing import Literal
 
 from mcp.shared.inbound import decode_header_value
 from mcp_types import INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
 
 from .auth import Principal
 from .config import Settings
@@ -36,7 +37,6 @@ ALLOWED_METHODS = frozenset(
     }
 )
 
-MODERN_SINCE = "2026-07-28"
 _MIRRORED_FIELD = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
 
 
@@ -45,14 +45,14 @@ def _values(raw_headers, name: bytes) -> list[bytes]:
 
 
 def protocol_era(raw_headers) -> Literal["legacy", "modern"]:
+    """Same rule as the SDK's streamable HTTP manager: first header value, no trimming.
+
+    Modern iff the header is present and not one of the initialize-handshake versions.
+    """
     values = _values(raw_headers, b"mcp-protocol-version")
-    if len(values) != 1:
+    if not values:
         return "legacy"
-    try:
-        version = values[0].decode("ascii").strip()
-    except UnicodeDecodeError:
-        return "legacy"
-    return "modern" if version >= MODERN_SINCE else "legacy"
+    return "legacy" if values[0].decode("latin-1") in HANDSHAKE_PROTOCOL_VERSIONS else "modern"
 
 
 def is_admin_tool(name: str) -> bool:
@@ -91,7 +91,8 @@ def authorize(msg: RpcMessage, principal: Principal, settings: Settings, era: st
         return Decision(True, "client_response")
     method = msg.method or ""
     if method not in ALLOWED_METHODS and not method.startswith("notifications/"):
-        status = 404 if era == "modern" else 200
+        # A notification has no response slot for a JSON-RPC error, so signal it in HTTP.
+        status = 400 if msg.kind == "notification" else (404 if era == "modern" else 200)
         raise RpcReject(status, METHOD_NOT_FOUND, "Method not found", msg.id, "unknown_method")
     if method == "tools/call":
         if msg.kind != "request":
