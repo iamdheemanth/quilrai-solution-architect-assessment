@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlsplit
 
 import anyio
@@ -12,6 +13,8 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
 from .jsonrpc import error_body
+
+logger = logging.getLogger(__name__)
 
 HOP_BY_HOP = frozenset(
     {
@@ -90,6 +93,9 @@ async def proxy_endpoint(request: Request) -> Response:
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+        except httpx2.TransportError as exc:
+            # Headers are already sent: no status can change, so log and end the stream.
+            logger.warning("Downstream failed mid-stream: %s", type(exc).__name__)
         finally:
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
