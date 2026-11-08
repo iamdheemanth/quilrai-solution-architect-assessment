@@ -150,6 +150,47 @@ ACCEPTED = [
 ]
 
 
-@pytest.mark.parametrize("body", ACCEPTED)
+_BS = chr(92)  # one literal backslash
+
+
+def _wrap(args: str) -> bytes:
+    head = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":'
+    )
+    return (head + args + "}}").encode("utf-8")
+
+
+HARD_ACCEPTED = {
+    "escaped-key": _wrap('{"n' + _BS + 'u0061me_x":1}'),
+    "surrogate-pair": _wrap('{"s":"' + _BS + "ud83d" + _BS + 'ude00"}'),
+    "raw-astral": _wrap('{"s":"\U0001f600\U0010ffff"}'),
+    "int-2^64": _wrap('{"n":18446744073709551616}'),
+    "int-4300-digits": _wrap('{"n":' + "9" * 4300 + "}"),
+    "neg-zero-float": _wrap('{"n":-0.0}'),
+    "neg-zero-int": _wrap('{"n":-0}'),
+    "int-vs-float-vs-bool": _wrap('{"a":1,"b":1.0,"c":true,"d":0,"e":false}'),
+    "tiny-underflow": _wrap('{"n":1e-400}'),
+    "subnormal": _wrap('{"n":5e-324}'),
+    "mantissa-700-digits": _wrap('{"n":0.' + "1" * 700 + "}"),
+    "raw-del-c1-ls-bom-ffff": _wrap('{"s":"\x7f\u0085\u2028\ufeff\uffff"}'),
+    "nfc-nfd-sibling-keys": _wrap('{"caf\u00e9":1,"cafe\u0301":2}'),
+    "depth-64": b'{"a":' * 63 + b"1" + b"}" * 63,
+    "escaped-slash-method": (
+        '{"jsonrpc":"2.0","id":1,"method":"tools' + _BS + '/call","params":{"name":"x"}}'
+    ).encode(),
+}
+
+
+def _dumps(value) -> str:
+    return json.dumps(value, sort_keys=False, ensure_ascii=True)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [*ACCEPTED, *HARD_ACCEPTED.values()],
+    ids=[*(f"base{i}" for i in range(len(ACCEPTED))), *HARD_ACCEPTED],
+)
 def test_accepted_bodies_decode_identically_in_both_sdk_parsers(body):
-    assert pydantic_core.from_json(body) == json.loads(body) == parse_strict(body)
+    # Serialising compares types too: 1 vs 1.0 vs True and -0.0 vs 0.0 all differ.
+    ours = _dumps(parse_strict(body))
+    assert ours == _dumps(pydantic_core.from_json(body)) == _dumps(json.loads(body))

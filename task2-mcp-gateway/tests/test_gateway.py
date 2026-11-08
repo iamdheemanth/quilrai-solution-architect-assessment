@@ -129,6 +129,16 @@ BYPASS_BODIES = [
     ),
     pytest.param(ADMIN_CALL.decode().encode("utf-16"), 400, -32700, id="utf-16"),
     pytest.param(b"\xef\xbb\xbf" + ADMIN_CALL, 400, -32700, id="bom"),
+    pytest.param(ADMIN_CALL.decode().encode("utf-16-le"), 400, -32700, id="utf-16-le-no-bom"),
+    pytest.param(ADMIN_CALL.decode().encode("utf-16-be"), 400, -32700, id="utf-16-be-no-bom"),
+    pytest.param(ADMIN_CALL.decode().encode("utf-32-le"), 400, -32700, id="utf-32-le-no-bom"),
+    pytest.param(ADMIN_CALL.decode().encode("utf-32-be"), 400, -32700, id="utf-32-be-no-bom"),
+    pytest.param(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\xed\xa0\x80"}}',
+        400,
+        -32700,
+        id="cesu8-surrogate",
+    ),
     pytest.param(_call_body('"name":"get_status","arguments":{"x":NaN}'), 400, -32700, id="nan"),
     pytest.param(b"[" + ADMIN_CALL + b"]", 400, -32600, id="batch"),
     pytest.param(b"[" + ADMIN_CALL + b"," + ADMIN_CALL + b"]", 400, -32600, id="batch-two"),
@@ -174,6 +184,8 @@ async def test_bypass_bodies_never_reach_downstream(body, status, code):
         r = await c.post("/mcp", content=body, headers=headers("viewer"))
     assert r.status_code == status
     assert r.json()["error"]["code"] == code
+    if code == -32700:
+        assert r.json()["id"] is None
     assert r.headers["content-type"] == "application/json"
     assert calls == []
 
