@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Keep out of submission
+research_notes/
+reports/
+docs/superpowers/
+.superpowers/
