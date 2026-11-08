@@ -5,7 +5,7 @@ original bytes of every event so unchanged frames can be forwarded verbatim.
 """
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 _EOL = re.compile(rb"[\r\n]")
@@ -34,7 +34,6 @@ class SSEParser:
         self._event = ""
         self._started = False  # BOM decision made
         self._skip_lf = False  # previous line ended with CR at end of a feed
-        self._held: SSEEvent | None = None  # event whose terminator was a trailing CR
 
     def feed(self, chunk: bytes) -> list[SSEEvent]:
         out: list[SSEEvent] = []
@@ -51,18 +50,12 @@ class SSEParser:
                 return out
         start = 0
         if self._skip_lf:
-            # An LF right after a feed-final CR belongs to that CRLF terminator.
+            # An LF right after a feed-final CR is part of that CRLF terminator.
+            # The line was already dispatched on the CR, so the LF is dropped
+            # (not re-emitted in any raw).
             self._skip_lf = False
             if chunk[0] == 0x0A:
-                if self._held is not None:
-                    self._held = replace(self._held, raw=self._held.raw + b"\n")
-                elif self._raw:
-                    self._raw += b"\n"
                 start = 1
-        if self._held is not None:
-            out.append(self._held)
-            self._held = None
-        produced = False
         last_end = -1
         while (m := _EOL.search(chunk, start)) is not None:
             end = m.start()
@@ -78,7 +71,6 @@ class SSEParser:
                 raw_line += b"\n"
                 start = last_end = start + 1
             ev = self._line(line, raw_line)
-            produced = ev is not None
             if ev is not None:
                 out.append(ev)
         if start < len(chunk):
@@ -88,9 +80,7 @@ class SSEParser:
             if len(self._raw) + len(self._buf) > self._max_event:
                 raise SSEError("SSE event exceeds limit")
         elif last_end == len(chunk) and chunk[-1] == 0x0D:
-            self._skip_lf = True
-            if produced:
-                self._held = out.pop()
+            self._skip_lf = True  # a following LF is swallowed; events are never held
         return out
 
     def _line(self, line: str, raw_line: bytes) -> SSEEvent | None:
@@ -118,9 +108,7 @@ class SSEParser:
         return None
 
     def close(self) -> list[SSEEvent]:
-        out = [self._held] if self._held is not None else []
-        self._held = None
         self._buf.clear()
         self._raw.clear()
         self._data, self._event = [], ""
-        return out
+        return []
