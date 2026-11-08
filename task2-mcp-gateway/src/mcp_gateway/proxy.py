@@ -60,9 +60,11 @@ def filter_headers(
     return out
 
 
-def json_response(status: int, rpc_id, message: str, code: int = INTERNAL_ERROR) -> Response:
+def json_response(status: int, rpc_id, message: str) -> Response:
     return Response(
-        error_body(rpc_id, code, message), status_code=status, media_type="application/json"
+        error_body(rpc_id, INTERNAL_ERROR, message),
+        status_code=status,
+        media_type="application/json",
     )
 
 

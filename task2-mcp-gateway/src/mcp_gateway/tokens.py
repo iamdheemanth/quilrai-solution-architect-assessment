@@ -9,9 +9,7 @@ import time
 
 import jwt
 
-from mcp_gateway.config import Role, Settings
-
-_MIN_SECRET_BYTES = 32
+from mcp_gateway.config import MIN_SECRET_BYTES, Role, Settings
 
 
 def mint_token(
@@ -43,9 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     secret = os.environ.get("GATEWAY_JWT_SECRET", "")
-    if len(secret.encode("utf-8")) < _MIN_SECRET_BYTES:
+    if len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
         sys.stderr.write(
-            f"error: GATEWAY_JWT_SECRET must be set to at least {_MIN_SECRET_BYTES} bytes\n"
+            f"error: GATEWAY_JWT_SECRET must be set to at least {MIN_SECRET_BYTES} bytes\n"
         )
         return 2
     audience = os.environ.get("GATEWAY_JWT_AUDIENCE", "").strip() or Settings.jwt_audience

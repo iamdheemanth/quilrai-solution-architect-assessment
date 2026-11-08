@@ -12,10 +12,10 @@ Role = Literal["admin", "viewer"]
 AuthMode = Literal["jwt", "static"]
 
 _AUTH_MODES = ("jwt", "static")
-_ROLES = ("admin", "viewer")
+ROLES = ("admin", "viewer")
 _DENY_STATUSES = (200, 403)
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
-_MIN_SECRET_BYTES = 32
+MIN_SECRET_BYTES = 32
 
 
 class ConfigError(ValueError):
@@ -85,7 +85,7 @@ def _parse_static_tokens(raw: str) -> dict[str, Role]:
         if not item.strip():
             continue
         token, sep, role = (part.strip() for part in item.partition("="))
-        if not sep or not token or role.lower() not in _ROLES:
+        if not sep or not token or role.lower() not in ROLES:
             raise ConfigError(f"{name} must be {fmt}")
         if token in tokens:
             raise ConfigError(f"{name} must be {fmt}; a token is listed more than once")
@@ -104,9 +104,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     static_tokens: dict[str, Role] = {}
     if auth_mode == "jwt":
         jwt_secret = env.get("GATEWAY_JWT_SECRET", "")
-        if len(jwt_secret.encode("utf-8")) < _MIN_SECRET_BYTES:
+        if len(jwt_secret.encode("utf-8")) < MIN_SECRET_BYTES:
             raise ConfigError(
-                f"GATEWAY_JWT_SECRET must be at least {_MIN_SECRET_BYTES} bytes "
+                f"GATEWAY_JWT_SECRET must be at least {MIN_SECRET_BYTES} bytes "
                 "when GATEWAY_AUTH_MODE=jwt"
             )
     else:

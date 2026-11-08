@@ -87,6 +87,7 @@ class Decision:
 
 
 def authorize(msg: RpcMessage, principal: Principal, settings: Settings, era: str) -> Decision:
+    """Decide one message; ``settings`` is reserved for policy options."""
     if msg.kind == "response":
         return Decision(True, "client_response")
     method = msg.method or ""

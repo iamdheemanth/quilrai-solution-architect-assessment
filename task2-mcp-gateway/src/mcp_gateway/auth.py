@@ -15,12 +15,11 @@ from dataclasses import dataclass
 
 import jwt
 
-from mcp_gateway.config import Role, Settings
+from mcp_gateway.config import ROLES, Role, Settings
 
 REALM = 'Bearer realm="mcp-gateway"'
 _INVALID_REQUEST = f'{REALM}, error="invalid_request"'
 _INVALID_TOKEN = f'{REALM}, error="invalid_token"'
-_ROLES = ("admin", "viewer")
 _B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 _REQUIRED_CLAIMS = ["exp", "iat", "sub", "role", "aud", "iss"]
 _LEEWAY_SECONDS = 30
@@ -81,7 +80,7 @@ class JwtVerifier:
             raise _invalid_token("jwt_rejected") from None
         role = claims.get("role")
         subject = claims.get("sub")
-        if role not in _ROLES:
+        if role not in ROLES:
             raise _invalid_token("unknown_role")
         if not isinstance(subject, str) or not subject:
             raise _invalid_token("invalid_subject")

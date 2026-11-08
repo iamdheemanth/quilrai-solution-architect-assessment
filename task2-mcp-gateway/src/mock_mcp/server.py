@@ -77,3 +77,7 @@ def main() -> None:
     stateless = _env_bool("MOCK_STATELESS", True)
     mock = build_mock(json_response=json_response, stateless=stateless)
     uvicorn.run(mock.app, host=host, port=port, log_level="info", server_header=False)
+
+
+if __name__ == "__main__":
+    main()
