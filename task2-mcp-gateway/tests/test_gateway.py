@@ -419,12 +419,23 @@ async def test_downstream_errors_relayed_verbatim(status):
     assert len(calls) == 1
 
 
-async def test_downstream_unreachable_502():
+def _proxy_warnings(caplog):
+    return [
+        r for r in caplog.records if r.name == "mcp_gateway.proxy" and r.levelno == logging.WARNING
+    ]
+
+
+async def test_downstream_unreachable_502(caplog):
     def handler(request):
         raise httpx2.ConnectError("refused")
 
-    async with gateway(handler) as (c, calls):
-        r = await c.post("/mcp", content=rpc("tools/list", id=5), headers=headers("viewer"))
+    with caplog.at_level(logging.WARNING, logger="mcp_gateway.proxy"):
+        async with gateway(handler) as (c, calls):
+            r = await c.post("/mcp", content=rpc("tools/list", id=5), headers=headers("viewer"))
+    [warning] = _proxy_warnings(caplog)
+    text = warning.getMessage()
+    assert "ConnectError" in text and "downstream_unavailable" in text and "request_id=" in text
+    assert "refused" not in text and "viewer" not in text
     assert r.status_code == 502
     assert r.json() == {
         "jsonrpc": "2.0",
@@ -434,12 +445,16 @@ async def test_downstream_unreachable_502():
     assert len(calls) == 1
 
 
-async def test_downstream_timeout_504():
+async def test_downstream_timeout_504(caplog):
     def handler(request):
         raise httpx2.ReadTimeout("slow")
 
-    async with gateway(handler) as (c, calls):
-        r = await c.post("/mcp", content=rpc("tools/list", id=5), headers=headers("viewer"))
+    with caplog.at_level(logging.WARNING, logger="mcp_gateway.proxy"):
+        async with gateway(handler) as (c, calls):
+            r = await c.post("/mcp", content=rpc("tools/list", id=5), headers=headers("viewer"))
+    [warning] = _proxy_warnings(caplog)
+    text = warning.getMessage()
+    assert "ReadTimeout" in text and "downstream_timeout" in text and "request_id=" in text
     assert r.status_code == 504
     assert r.json()["error"] == {"code": -32603, "message": "Downstream timeout"}
     assert r.json()["id"] == 5

@@ -66,6 +66,16 @@ def json_response(status: int, rpc_id, message: str, code: int = INTERNAL_ERROR)
     )
 
 
+def _warn_failed(exc: Exception, state: dict, outcome: str) -> None:
+    """One WARNING per failed forward: class name, request id and outcome only."""
+    logger.warning(
+        "Downstream forward failed: outcome=%s error=%s request_id=%s",
+        outcome,
+        type(exc).__name__,
+        state.get("request_id"),
+    )
+
+
 async def proxy_endpoint(request: Request) -> Response:
     client: httpx2.AsyncClient = request.app.state.upstream
     settings = request.app.state.settings
@@ -84,9 +94,11 @@ async def proxy_endpoint(request: Request) -> Response:
     up_req = client.build_request(request.method, target, headers=headers, content=body)
     try:
         upstream = await client.send(up_req, stream=True)
-    except httpx2.TimeoutException:  # subclass of TransportError: catch first
+    except httpx2.TimeoutException as exc:  # subclass of TransportError: catch first
+        _warn_failed(exc, state, "downstream_timeout")
         return json_response(504, rpc_id, "Downstream timeout")
-    except httpx2.TransportError:
+    except httpx2.TransportError as exc:
+        _warn_failed(exc, state, "downstream_unavailable")
         return json_response(502, rpc_id, "Downstream unavailable")
 
     async def relay():
