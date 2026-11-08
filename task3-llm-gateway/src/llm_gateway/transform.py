@@ -23,6 +23,15 @@ _DONE = b"data: [DONE]\n\n"
 _ENVELOPE = ("id", "object", "created", "model", "system_fingerprint")
 
 
+def _no_dupes(pairs: list[tuple[str, object]]) -> dict:
+    d: dict = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate key in upstream JSON")
+        d[k] = v
+    return d
+
+
 def _frame(obj: dict) -> bytes:
     return b"data: " + json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode() + b"\n\n"
 
@@ -34,6 +43,7 @@ class StreamTransformer:
         self._all: list[StreamRedactor] = []  # every redactor ever made, for stats
         self._seen: set[int] = set()
         self._finished: set[int] = set()
+        self._sealed: set[int] = set()  # finished or closed: no more text may arrive
         self._env: dict = {}
 
     # ------------------------------------------------------------------ helpers
@@ -78,6 +88,7 @@ class StreamTransformer:
                 continue
             released: dict[tuple, str] = {}
             self._close_choice(i, released)
+            self._sealed.add(i)
             ch = self._synthetic_choice(i, released)
             if ch:
                 choices.append(ch)
@@ -95,12 +106,12 @@ class StreamTransformer:
             self.done = True
             return out
         try:
-            obj = json.loads(ev.data)
+            obj = json.loads(ev.data, object_pairs_hook=_no_dupes)
         except ValueError:
             raise ValueError("upstream data frame is not valid JSON") from None
         if not isinstance(obj, dict):
             raise ValueError("upstream data frame is not a JSON object")
-        if "error" in obj:
+        if obj.get("error") is not None:
             self.discard()
             err = obj["error"]
             if isinstance(err, dict) and isinstance(err.get("message"), str):
@@ -110,23 +121,69 @@ class StreamTransformer:
             return _frame(obj)
         env = {k: obj[k] for k in _ENVELOPE if k in obj}
         self._env = env
-        choices = obj.get("choices")
-        if not isinstance(choices, list):
+        if "choices" not in obj:
             return ev.raw
+        choices = obj["choices"]
+        if not isinstance(choices, list):
+            raise ValueError("choices is not a list")
         if not choices:
-            return self._close_unfinished() + ev.raw
+            if "usage" in obj:  # terminal usage chunk: seal every unfinished choice
+                return self._close_unfinished() + ev.raw
+            return ev.raw
 
+        for ch in choices:
+            self._validate_choice(ch)
         changed = False
         synthetic: list[dict] = []
         for ch in choices:
-            if not isinstance(ch, dict):
-                raise ValueError("choice is not an object")
             c, syn = self._transform_choice(ch)
             changed = changed or c
             if syn:
                 synthetic.append(syn)
         pre = self._synthetic_chunk(env, synthetic)
         return pre + (_frame(obj) if changed else ev.raw)
+
+    @staticmethod
+    def _text_fields(delta: dict):
+        """Yield (container, name, key_suffix, args) for each text channel; validates shapes."""
+        for name in ("content", "refusal"):
+            yield delta, name, (name,), False
+        tcs = delta.get("tool_calls")
+        if tcs is not None:
+            if not isinstance(tcs, list):
+                raise ValueError("tool_calls is not a list")
+            for pos, tc in enumerate(tcs):
+                if not isinstance(tc, dict):
+                    raise ValueError("tool call is not an object")
+                fn = tc.get("function")
+                if fn is None:
+                    continue
+                if not isinstance(fn, dict):
+                    raise ValueError("tool call function is not an object")
+                yield fn, "arguments", ("tool", tc.get("index", pos)), True
+        fc = delta.get("function_call")
+        if fc is not None:
+            if not isinstance(fc, dict):
+                raise ValueError("function_call is not an object")
+            yield fc, "arguments", ("function_call",), True
+
+    def _validate_choice(self, ch: object) -> None:
+        if not isinstance(ch, dict):
+            raise ValueError("choice is not an object")
+        delta = ch.get("delta")
+        if delta is None:
+            return
+        if not isinstance(delta, dict):
+            raise ValueError("delta is not an object")
+        sealed = ch.get("index", 0) in self._sealed
+        for container, name, _, _ in self._text_fields(delta):
+            text = container.get(name)
+            if text is None:
+                continue
+            if not isinstance(text, str):
+                raise ValueError("text channel is not a string")
+            if text and sealed:
+                raise ValueError("text after choice was finished")
 
     def _transform_choice(self, ch: dict) -> tuple[bool, dict | None]:
         i = ch.get("index", 0)
@@ -135,17 +192,15 @@ class StreamTransformer:
         if ch.get("logprobs") is not None:
             ch["logprobs"] = None
             changed = True
-        delta = ch.get("delta")
-        if not isinstance(delta, dict):
-            delta = {}
+        delta = ch.get("delta") or {}
         finishing = ch.get("finish_reason") is not None
         released: dict[tuple, str] = {}  # finish only: the chunk's own text moves to synthetic
 
-        def run_field(container: dict, name: str, key: tuple, args: bool) -> None:
-            nonlocal changed
+        for container, name, suffix, args in self._text_fields(delta):
             text = container.get(name)
             if not isinstance(text, str):
-                return
+                continue
+            key = (i, *suffix)
             out = self._get(key, args).feed(text)
             if finishing:
                 released[key] = out
@@ -155,21 +210,10 @@ class StreamTransformer:
                 container[name] = out
                 changed = changed or out != text
 
-        run_field(delta, "content", (i, "content"), False)
-        run_field(delta, "refusal", (i, "refusal"), False)
-        tcs = delta.get("tool_calls")
-        if isinstance(tcs, list):
-            for pos, tc in enumerate(tcs):
-                fn = tc.get("function") if isinstance(tc, dict) else None
-                if isinstance(fn, dict):
-                    run_field(fn, "arguments", (i, "tool", tc.get("index", pos)), True)
-        fc = delta.get("function_call")
-        if isinstance(fc, dict):
-            run_field(fc, "arguments", (i, "function_call"), True)
-
         syn = None
         if finishing:
             self._finished.add(i)
+            self._sealed.add(i)
             self._close_choice(i, released)
             syn = self._synthetic_choice(i, released)
         return changed, syn
@@ -177,13 +221,15 @@ class StreamTransformer:
     def on_eof(self) -> bytes:
         if self.done:
             return b""
-        if self._seen <= self._finished:
+        if self._finished and self._seen <= self._finished:
             self.done = True
             return _DONE
         self.discard()
         return ERROR_FRAME
 
     def discard(self) -> None:
+        for r in self._all:
+            r.discard()
         self._red.clear()
         self.done = True
 

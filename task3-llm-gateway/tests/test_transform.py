@@ -1,6 +1,8 @@
 import json
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from llm_gateway.patterns import batch_redact
 from llm_gateway.transform import (
@@ -303,3 +305,157 @@ def test_redact_completion():
 def test_redact_error_body():
     out = redact_error_body({"error": {"message": "bad a@b.com", "code": "x"}})
     assert out == {"error": {"message": "bad [REDACTED]", "code": "x"}}
+
+
+def _feed_until_raise(tx, *frames):
+    """Run frames, returning (output_before_raise, raised)."""
+    out = b""
+    try:
+        for f in frames:
+            for ev in events(f):
+                out += tx.on_event(ev)
+    except ValueError:
+        return out, True
+    return out, False
+
+
+def test_text_after_finish_fails_closed():
+    tx = StreamTransformer()
+    out, raised = _feed_until_raise(
+        tx, sse(chunk("mail john@", finish="stop")), sse(chunk("x.com bye"))
+    )
+    assert raised
+    assert b"john@x" not in out and b"x.com" not in out
+
+
+def test_text_after_empty_choices_usage_chunk_fails_closed():
+    tx = StreamTransformer()
+    out, raised = _feed_until_raise(
+        tx,
+        sse(chunk("mail john@")),
+        sse(chunk(choices=[], usage={"total_tokens": 1})),
+        sse(chunk("x.com")),
+    )
+    assert raised
+    assert b"john@x" not in out and b"x.com" not in out
+
+
+def test_new_tool_text_after_finish_fails_closed():
+    tx = StreamTransformer()
+    _, raised = _feed_until_raise(
+        tx, sse(chunk(finish="stop")), sse(chunk(tool_calls=[tool(0, "a@b")]))
+    )
+    assert raised
+
+
+def test_empty_choices_without_usage_does_not_close():
+    tx = StreamTransformer()
+    out = run(tx, sse(chunk("mail john@")))
+    empty = sse(chunk(choices=[]))
+    (ev,) = events(empty)
+    assert tx.on_event(ev) == ev.raw
+    out += run(tx, sse(chunk("x.com ok ")), sse(chunk(finish="stop")), sse("[DONE]"))
+    assert content_of(parse_out(out)) == "mail [REDACTED] ok "
+
+
+def _raw(data: str) -> bytes:
+    return b"data: " + data.encode() + b"\n\n"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        '{"choices":[{"index":0,"delta":{"content":["john@x.com"]}}]}',
+        '{"choices":[{"index":0,"delta":"john@x.com "}]}',
+        '{"choices":"john@x.com"}',
+        '{"choices":null}',
+        '{"choices":["john@x.com"]}',
+        '{"choices":[{"index":0,"delta":{"refusal":5}}]}',
+        '{"choices":[{"index":0,"delta":{"function_call":{"arguments":{"a":"b"}}}}]}',
+        '{"choices":[{"index":0,"delta":{"function_call":"john@x.com"}}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":"john@x.com"}}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":["john@x.com"]}}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":"a@b.com"}]}}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":1}}]}}]}',
+    ],
+)
+def test_malformed_shapes_raise(data):
+    tx = StreamTransformer()
+    (ev,) = events(_raw(data))
+    with pytest.raises(ValueError):
+        tx.on_event(ev)
+
+
+def test_error_null_is_a_normal_chunk():
+    tx = StreamTransformer()
+    obj = chunk("hello ")
+    obj["error"] = None
+    (ev,) = events(sse(obj))
+    assert tx.on_event(ev) == ev.raw
+    assert not tx.done
+
+
+def test_eof_without_any_finished_choice_fails_closed():
+    assert StreamTransformer().on_eof() == ERROR_FRAME
+    tx = StreamTransformer()
+    run(tx, sse(chunk(choices=[], usage={"total_tokens": 1})))
+    assert tx.on_eof() == ERROR_FRAME
+
+
+def test_duplicate_keys_raise():
+    tx = StreamTransformer()
+    data = '{"choices":[{"index":0,"delta":{"content":"john@x.com ","content":"ok. "}}]}'
+    (ev,) = events(_raw(data))
+    with pytest.raises(ValueError):
+        tx.on_event(ev)
+
+
+def test_discard_empties_every_redactor():
+    tx = StreamTransformer()
+    run(tx, sse(chunk("mail john@x", index=0)), sse(chunk("a b 123-45-", index=1)))
+    assert any(r.held for r in tx._all)
+    tx.discard()
+    assert tx._all and all(r.held == 0 for r in tx._all)
+
+
+_PIECES = st.sampled_from(
+    ["john@x.com", "a@b.org", "123-45-6789", "4111 1111 1111 1111", "hi ", " ", "@", ".", "-", "9"]
+    + ["café ", "x", "42 ", "\n", "123-45-"]
+)
+
+
+@settings(max_examples=600, deadline=None)
+@given(
+    texts=st.lists(st.lists(_PIECES, max_size=8).map("".join), min_size=1, max_size=2),
+    seed=st.randoms(use_true_random=False),
+    logprobs=st.booleans(),
+    usage=st.booleans(),
+)
+def test_transformer_property(texts, seed, logprobs, usage):
+    # split each choice's text into random deltas (empty ones included)
+    queues = []
+    for t in texts:
+        cuts = sorted(seed.randint(0, len(t)) for _ in range(seed.randint(0, 5)))
+        pieces = [t[a:b] for a, b in zip([0, *cuts], [*cuts, len(t)], strict=True)]
+        queues.append(pieces)
+    lp = {"content": [{"token": "t"}]} if logprobs else None
+    frames = []
+    pending = [(i, list(q)) for i, q in enumerate(queues)]
+    while any(q for _, q in pending):
+        i, q = seed.choice([p for p in pending if p[1]])
+        piece = q.pop(0)
+        last = not q
+        frames.append(sse(chunk(piece, index=i, logprobs=lp, finish="stop" if last else None)))
+    if usage:
+        frames.append(sse(chunk(choices=[], usage={"total_tokens": 1})))
+    frames.append(sse("[DONE]"))
+    tx = StreamTransformer()
+    out = run(tx, *frames)
+    objs = parse_out(out)
+    assert objs[-1] == "[DONE]" and objs.count("[DONE]") == 1
+    for i, t in enumerate(texts):
+        assert content_of(objs, i) == batch_redact(t)
+    for o in objs[:-1]:
+        for c in o["choices"]:
+            assert c.get("logprobs") is None
+    assert tx.on_event(events(sse(chunk("zz ")))[0]) == b""
