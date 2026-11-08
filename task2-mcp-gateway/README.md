@@ -289,8 +289,8 @@ The core risk of an authorizing proxy is that it and the downstream read the sam
 
 | # | Attack input | Gateway behaviour | Proving test |
 |---|---|---|---|
-| 1 | Duplicate `name`, `params`, `method` or `id` keys (also `name` vs `name`) | 400, `-32700`, id null | `test_gateway.py::test_bypass_bodies_never_reach_downstream` [dup-name, dup-params, dup-method, dup-id, dup-name-escaped]; `test_integration.py::test_duplicate_key_body_rejected_and_nothing_called` (real SDK mock) |
-| 2 | `"admin_reset_key"` (escaped tool name) | Authorized on the decoded value: viewer gets `-32001` | same test [escaped-admin-name]; `test_jsonrpc.py::test_escaped_name_is_decoded` |
+| 1 | Duplicate `name`, `params`, `method` or `id` keys (also `name` vs `n\u0061me`) | 400, `-32700`, id null | `test_gateway.py::test_bypass_bodies_never_reach_downstream` [dup-name, dup-params, dup-method, dup-id, dup-name-escaped]; `test_integration.py::test_duplicate_key_body_rejected_and_nothing_called` (real SDK mock) |
+| 2 | `"\u0061dmin_reset_key"` (escaped tool name) | Authorized on the decoded value: viewer gets `-32001` | same test [escaped-admin-name]; `test_jsonrpc.py::test_escaped_name_is_decoded` |
 | 3 | UTF-16, UTF-32 or BOM-prefixed body (plus `NaN`) | 400, `-32700` | same test [utf-16, bom, nan]; `test_jsonrpc.py::test_parse_rejects_with_32700` (UTF-8 BOM, UTF-16, UTF-32, `NaN`, `Infinity`, `1e400`, lone surrogates, depth) |
 | 4 | Missing, duplicated, malformed, forged, expired, `alg=none`, HS512 or wrong-audience token, on `tools/list` and `tools/call` | 401/400 before the body is read; no default role | `test_gateway.py::test_auth_failures_never_reach_downstream` (12 cases); `test_auth.py::test_invalid_tokens_are_401_invalid_token`, `test_extract_bearer_errors`; `test_unparseable_body_without_token_is_401_not_400` |
 | 5 | `method` together with `result` | 400, `-32600` | `test_bypass_bodies_never_reach_downstream` [method-plus-result] |
