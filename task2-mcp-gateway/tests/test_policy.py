@@ -189,6 +189,19 @@ def test_audit_event_never_raises_on_odd_values(caplog):
     assert json.loads(r.getMessage())["event"] == "authz.decision"
 
 
+@pytest.mark.parametrize("bad", [{(1, 2): "tuple key"}, "circular"])
+def test_audit_event_unserializable_fields_fallback(caplog, bad):
+    # default=str absorbs odd values but not non-string keys or cycles: those reach the fallback.
+    if bad == "circular":
+        bad = []
+        bad.append(bad)
+    with caplog.at_level(logging.INFO, logger="mcp_gateway.audit"):
+        audit_event(decision="deny", payload=bad)
+    [r] = [r for r in caplog.records if r.name == "mcp_gateway.audit"]
+    rec = json.loads(r.getMessage())
+    assert rec["error"] == "unserializable_fields" and "decision" not in rec
+
+
 def test_safe_name_caps_at_64():
     assert MAX_ECHO == 64
     assert safe_name("a" * 500) == "a" * 64 + "\u2026"

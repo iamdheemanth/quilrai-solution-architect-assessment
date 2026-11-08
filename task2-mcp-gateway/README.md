@@ -186,7 +186,7 @@ All settings come from environment variables, are read once at startup, and are 
 | `GATEWAY_STATIC_TOKENS` | none, required in `static` mode | `token=role[,token=role]`, role `admin` or `viewer`, tokens unique and non-empty |
 | `GATEWAY_JWT_AUDIENCE` | `mcp-gateway` | Required `aud` claim |
 | `GATEWAY_JWT_ISSUER` | `mcp-gateway-dev` | Required `iss` claim |
-| `GATEWAY_DOWNSTREAM_URL` | `http://127.0.0.1:8001/mcp` | The upstream MCP endpoint |
+| `GATEWAY_DOWNSTREAM_URL` | `http://127.0.0.1:8001/mcp` | The upstream MCP endpoint; must be `http://` or `https://` with a host, otherwise startup exits with code 2 |
 | `GATEWAY_HOST` / `GATEWAY_PORT` | `127.0.0.1` / `8000` | Listen address |
 | `GATEWAY_MAX_BODY_BYTES` | `4194304` (4 MiB) | Larger bodies get HTTP 413 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`; audit lines are INFO |
@@ -214,7 +214,7 @@ The app is a Starlette application with one route (`/mcp`, POST/GET/DELETE) and 
 
 Parsing details (`src/mcp_gateway/jsonrpc.py`). The gateway authorizes on the decoded body, so it must reject every body that the downstream SDK might read differently from the way the gateway read it. The accepted profile is I-JSON (RFC 7493): UTF-8 only, BOM rejected, duplicate object keys rejected (compared after `\u` unescaping), `NaN`/`Infinity`/overflowing floats like `1e400` rejected, lone surrogates rejected, nesting depth at most 64. Any violation is HTTP 400, `-32700`, `id: null`, and nothing is forwarded. After parsing, a message is classified by `method`: an object with `method` and a string-or-integer `id` is a request, without `id` a notification; an object without `method` is a client response (valid only with an `id` and exactly one of `result`/`error`). Arrays (batches), scalars, a wrong `jsonrpc` version, `method` together with `result` or `error`, and booleans, floats, `null` or objects as `id` are `-32600`. A `tools/call` without an `id` is `-32600`, never treated as a notification.
 
-Era detection (`policy.py`): the gateway reads `MCP-Protocol-Version` exactly as the SDK does. A single header value of `2026-07-28` or later is "modern"; anything else (missing, duplicated, older) is "legacy". The era only changes one response: the status of `-32601` (see the matrix). Authorization is identical in both eras.
+Era detection (`policy.py`): the gateway reads `MCP-Protocol-Version` exactly as the SDK does. The first `MCP-Protocol-Version` value decides: it is "modern" if present and not one of the SDK's initialize-handshake versions (`mcp_types.version.HANDSHAKE_PROTOCOL_VERSIONS`, currently 2024-11-05 to 2025-11-25), so `2026-07-28` and any unknown value are modern; a missing header is "legacy". The era only changes one response: the status of `-32601` (see the matrix). Authorization is identical in both eras.
 
 ## 5. Authorization rules and the `-32001` response
 
@@ -267,11 +267,11 @@ Every response the gateway generates itself, in pipeline order. `id` is the requ
 | Path other than exactly `/mcp` | 404 | `-32600` "Not Found" | null |
 | Method other than POST, GET, DELETE (including implicit HEAD) | 405, `Allow: POST, GET, DELETE` | `-32600` "Method Not Allowed" | null |
 | Non-JSON `Content-Type`, charset other than UTF-8, any `Content-Encoding` | 415 | `-32600` | null |
-| Body over the cap (chunked bodies count too) | 413, Starlette's plain-text response | none | none |
+| Body over the cap (chunked bodies count too) | 413, Starlette's plain-text response; **not audited** | none | none |
 | Outside I-JSON: bad UTF-8, BOM, duplicate key, NaN/Infinity, lone surrogate, depth over 64, not JSON | 400 | `-32700` | null |
 | Array, scalar, bad `jsonrpc`, `method` plus `result`/`error`, invalid id, `tools/call` without id | 400 | `-32600` | null |
 | Mirrored header mismatch, or a duplicated `Mcp-Method`/`Mcp-Name` | 400 | `-32020` | echoed |
-| Method not on the allowlist | 404 on 2026-era requests, 200 on legacy | `-32601` | echoed |
+| Method not on the allowlist | 404 on 2026-era requests, 200 on legacy; 400 when sent as a notification (no id) | `-32601` | echoed (null for a notification) |
 | `tools/call` with `params` not an object, or `name` missing, empty or not a string | 400 | `-32602` | echoed |
 | Viewer calls an `admin_*` tool | 200 (403 with the opt-in) | `-32001` | echoed |
 | Downstream connect failure | 502 | `-32603` "Downstream unavailable" | echoed |
@@ -280,6 +280,8 @@ Every response the gateway generates itself, in pipeline order. `id` is the requ
 | Downstream fails after streaming started | headers already sent: upstream closed, warning logged, stream ends | none possible | n/a |
 
 Why `-32601` is 200 on legacy requests: the 2025-11-25 transport spec makes a client read a 404 as "session terminated, start a new session", whereas 2026-07-28 explicitly uses 404. The gateway picks the era the way the SDK does, from `MCP-Protocol-Version` (`test_modern_era_unknown_method_is_404`, `test_unknown_method_denied`).
+
+A client that disconnects while the gateway is still reading its body writes no audit record either.
 
 Sources: `middleware.py` (auth, 404/405/415, `-32001`), `jsonrpc.py` (`-32700`, `-32600`), `policy.py` (`-32020`, `-32601`, `-32602`), `proxy.py` (502/504).
 
@@ -291,7 +293,7 @@ The core risk of an authorizing proxy is that it and the downstream read the sam
 |---|---|---|---|
 | 1 | Duplicate `name`, `params`, `method` or `id` keys (also `name` vs `n\u0061me`) | 400, `-32700`, id null | `test_gateway.py::test_bypass_bodies_never_reach_downstream` [dup-name, dup-params, dup-method, dup-id, dup-name-escaped]; `test_integration.py::test_duplicate_key_body_rejected_and_nothing_called` (real SDK mock) |
 | 2 | `"\u0061dmin_reset_key"` (escaped tool name) | Authorized on the decoded value: viewer gets `-32001` | same test [escaped-admin-name]; `test_jsonrpc.py::test_escaped_name_is_decoded` |
-| 3 | UTF-16, UTF-32 or BOM-prefixed body (plus `NaN`) | 400, `-32700` | same test [utf-16, bom, nan]; `test_jsonrpc.py::test_parse_rejects_with_32700` (UTF-8 BOM, UTF-16, UTF-32, `NaN`, `Infinity`, `1e400`, lone surrogates, depth) |
+| 3 | UTF-16, UTF-32 (with or without BOM), BOM-prefixed or CESU-8 surrogate body (plus `NaN`) | 400, `-32700` | same test [utf-16, utf-16-le-no-bom, utf-16-be-no-bom, utf-32-le-no-bom, utf-32-be-no-bom, cesu8-surrogate, bom, nan]; `test_jsonrpc.py::test_parse_rejects_with_32700` (UTF-8 BOM, UTF-16, UTF-32, `NaN`, `Infinity`, `1e400`, lone surrogates, depth) |
 | 4 | Missing, duplicated, malformed, forged, expired, `alg=none`, HS512 or wrong-audience token, on `tools/list` and `tools/call` | 401/400 before the body is read; no default role | `test_gateway.py::test_auth_failures_never_reach_downstream` (12 cases); `test_auth.py::test_invalid_tokens_are_401_invalid_token`, `test_extract_bearer_errors`; `test_unparseable_body_without_token_is_401_not_400` |
 | 5 | `method` together with `result` | 400, `-32600` | `test_bypass_bodies_never_reach_downstream` [method-plus-result] |
 | 6 | `tools/call` with no id, or id `null`, `1.0`, `true` | 400, `-32600` (never 202, never forwarded) | [idless-tools-call, id-null, id-float, id-bool]; `test_jsonrpc.py::test_classify_rejects_with_32600` |
@@ -320,7 +322,7 @@ Request headers use a denylist, because RFC 9110 says a proxy must forward heade
 | Direction | Dropped | Set by the gateway |
 |---|---|---|
 | Client to downstream | `Authorization`, `Cookie`, `Host`, `Content-Length`, `Origin`, `Proxy-Authorization`, client `X-Request-Id`, any `X-Gateway-*`, `Accept-Encoding`, hop-by-hop (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`) and every header named in `Connection` | `Accept-Encoding: identity`, a gateway-generated `X-Request-Id`; `Host` and `Content-Length` are derived by httpx2 from the downstream URL and the body |
-| Downstream to client | hop-by-hop headers, headers named in `Connection`, `Server`, `Date` | nothing; status, `Content-Type`, `Mcp-Session-Id`, `Cache-Control`, `X-Accel-Buffering` and the rest are relayed |
+| Downstream to client | hop-by-hop headers, headers named in `Connection`, `Server`, `Date`, any `X-Gateway-*` | nothing; status, `Content-Type`, `Mcp-Session-Id`, `Cache-Control`, `X-Accel-Buffering` and the rest are relayed |
 
 Notes:
 
@@ -349,13 +351,13 @@ One JSON line per decision (allow, deny and reject), written at INFO level throu
 | `event`, `ts` | Always `authz.decision`; UTC ISO-8601 timestamp |
 | `decision` | `allow`, `deny` or `reject` |
 | `reason` | Machine-readable: `allowed`, `admin_tool_requires_admin_role`, `legacy_passthrough`, `client_response`, `missing_authorization`, `jwt_rejected`, `unknown_token`, `duplicate_key`, `unknown_method`, `header_mismatch`, `invalid_tool_name`, `unsupported_media_type`, ... |
-| `subject` | `sha256:` plus 12 hex characters of the JWT `sub` (static mode: `static:` plus a token hash); never the raw value |
+| `subject` | `sha256:` plus 12 hex characters of the JWT `sub` (static mode: `static:` plus 12 hex characters of a per-process keyed HMAC-SHA256 of the token, so lines correlate within a run but a guessed token cannot be confirmed); never the raw value |
 | `role`, `era` | `admin`/`viewer` or null; `legacy`/`modern` |
 | `method`, `tool`, `rpc_id` | From the decoded body, after `safe_name` escaping (string ids too) |
 | `request_id` | Generated per request and sent downstream as `X-Request-Id`, so the two logs correlate |
-| `upstream_contacted` | `false` for every deny and reject |
+| `upstream_contacted` | A forward was attempted. `false` for every deny and reject. A 502/504 after an allow still reads `true`; the failure appears as an extra WARNING on logger `mcp_gateway.proxy` (exception class, `request_id`, outcome `downstream_unavailable` or `downstream_timeout`; no body or headers) |
 
-Never logged: tool arguments, bodies, tokens, cookies, raw `Mcp-Session-Id` values. Every client-supplied string passes through `safe_name`, which escapes control and format characters and caps the value at 64 characters. The JSON encoder escapes CR/LF, so a tool named `x\nrefund decision=allow` cannot forge a second line. Auditing never raises: an unserializable field degrades to an `unserializable_fields` record (`test_each_decision_writes_one_audit_record`, `test_audit_event_never_raises_on_odd_values`). Source: `audit.py`.
+Never logged: tool arguments, bodies, tokens, cookies, raw `Mcp-Session-Id` values. Every client-supplied string passes through `safe_name`, which escapes control and format characters and caps the value at 64 characters. The JSON encoder escapes CR/LF, so a tool named `x\nrefund decision=allow` cannot forge a second line. Auditing never raises: an unserializable field (a non-string dict key or a cycle; `default=str` absorbs everything else) degrades to an `unserializable_fields` record (`test_each_decision_writes_one_audit_record`, `test_audit_event_never_raises_on_odd_values`, `test_audit_event_unserializable_fields_fallback`). Source: `audit.py`.
 
 ## 11. Design notes
 
@@ -377,7 +379,8 @@ Not implemented, on purpose. In rough priority order:
 4. **Tell the downstream who is calling.** Today the downstream sees an anonymous gateway: the mock enforces nothing, and the token is stripped. A real deployment should send a service credential (or a signed identity header that the downstream trusts only from the gateway's network position, with client-supplied copies stripped, which the `X-Gateway-*` drop already does) so the downstream can apply its own authorization and audit.
 5. **403 versus 200 for denials.** 200 follows the brief and JSON-RPC convention; 403 is closer to the MCP authorization spec (and to Kong's behaviour), and lets HTTP-level tooling (WAFs, metrics, alerting) see denials. `GATEWAY_DENY_HTTP_STATUS=403` provides it. Neither fixes the `-32001` band concern in [Section 5](#5-authorization-rules-and-the--32001-response).
 6. **JWKS and asymmetric keys.** A shared HS256 secret means the gateway can mint what it verifies and every verifier holds the signing key. Production should verify RS256/ES256 tokens from an identity provider's JWKS endpoint with key rotation, and add token revocation and short lifetimes.
-7. **Other items left out:** rate limiting and per-principal quotas, TLS termination and mTLS to the downstream, request timeouts per method, policy loaded from configuration rather than code, metrics, and an optional strict mode that refuses unknown tool names rather than leaving that to the downstream. Unknown-method forwarding, legacy GET/DELETE refusal and an `X-Gateway-Role` header were considered and not built; their defaults (deny, forward after auth, nothing sent) are the safe ones.
+7. **Connection pool sizing.** Long-lived legacy GET streams share httpx2's default pool (100 connections) with POSTs, so enough open streams can starve requests. Production would set explicit `httpx2.Limits` or use separate pools for streams and requests.
+8. **Other items left out:** rate limiting and per-principal quotas, TLS termination and mTLS to the downstream, request timeouts per method, policy loaded from configuration rather than code, metrics, and an optional strict mode that refuses unknown tool names rather than leaving that to the downstream. Unknown-method forwarding, legacy GET/DELETE refusal and an `X-Gateway-Role` header were considered and not built; their defaults (deny, forward after auth, nothing sent) are the safe ones.
 
 ## 13. Test evidence
 
@@ -388,10 +391,10 @@ $ uv sync --locked
 $ uv run ruff check .
 All checks passed!
 $ uv run pytest -q -W error
-200 passed in 1.72s
+238 passed in 2.1s
 ```
 
-`uv run pytest --collect-only -q` collects 200 tests. The layers are: unit tests (`test_jsonrpc`, `test_policy`, `test_auth`, `test_config`, `test_tokens`), the gateway through an ASGI transport with a recording mock upstream (`test_gateway`), the gateway against the real SDK mock (`test_integration`, `test_mock_mcp`), incremental SSE relay and disconnect handling (`test_streaming`), and end to end with real servers and the official SDK client in both protocol eras (`test_e2e`).
+`uv run pytest --collect-only -q` collects 238 tests. The layers are: unit tests (`test_jsonrpc`, `test_policy`, `test_auth`, `test_config`, `test_tokens`), the gateway through an ASGI transport with a recording mock upstream (`test_gateway`), the gateway against the real SDK mock (`test_integration`, `test_mock_mcp`), incremental SSE relay and disconnect handling (`test_streaming`), and end to end with real servers and the official SDK client in both protocol eras (`test_e2e`).
 
 Test names by file (parametrized tests are abbreviated to one line with the case count):
 
@@ -405,13 +408,15 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_static_verifier`
 - `test_build_verifier_selects_by_mode`
 
-**`tests/test_config.py`** (18)
+**`tests/test_config.py`** (25)
 
 - `test_defaults_with_jwt_secret`
 - `test_jwt_mode_requires_32_byte_secret` (2 cases)
 - `test_static_mode_parses_tokens`
 - `test_rejects_invalid` (10 cases)
 - `test_errors_never_leak_token_values`
+- `test_downstream_url_must_be_http_with_host` (4 cases)
+- `test_downstream_url_accepted` (3 cases)
 - `test_deny_status_403_opt_in`
 - `test_repr_hides_jwt_secret`
 - `test_repr_hides_static_tokens`
@@ -422,14 +427,14 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_viewer_allowed_tool_ok_and_admin_tool_denied` (2 cases)
 - `test_main_refuses_short_secret`
 
-**`tests/test_gateway.py`** (68)
+**`tests/test_gateway.py`** (73)
 
 - `test_viewer_admin_tool_denied_without_upstream_call`
 - `test_string_id_echoed_with_type`
 - `test_deny_status_403_opt_in`
 - `test_admin_admin_tool_forwarded_byte_identical`
 - `test_viewer_tools_list_forwarded_transparently`
-- `test_bypass_bodies_never_reach_downstream` (21 cases)
+- `test_bypass_bodies_never_reach_downstream` (26 cases)
 - `test_modern_era_unknown_method_is_404`
 - `test_auth_failures_never_reach_downstream` (12 cases)
 - `test_unparseable_body_without_token_is_401_not_400`
@@ -458,7 +463,7 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_viewer_tools_list_is_transparent`
 - `test_duplicate_key_body_rejected_and_nothing_called`
 
-**`tests/test_jsonrpc.py`** (38)
+**`tests/test_jsonrpc.py`** (53)
 
 - `test_parse_rejects_with_32700` (16 cases)
 - `test_depth_64_is_accepted`
@@ -469,7 +474,7 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_classify_returns_frozen_message`
 - `test_error_body_shape`
 - `test_constants`
-- `test_accepted_bodies_decode_identically_in_both_sdk_parsers` (3 cases)
+- `test_accepted_bodies_decode_identically_in_both_sdk_parsers` (18 cases)
 
 **`tests/test_mock_mcp.py`** (3)
 
@@ -477,7 +482,7 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_call_increments_counter`
 - `test_foreign_host_rejected_421`
 
-**`tests/test_policy.py`** (32)
+**`tests/test_policy.py`** (43)
 
 - `test_viewer_denied_admin_tool`
 - `test_admin_allowed_admin_tool`
@@ -487,6 +492,7 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_tools_call_without_id_rejected`
 - `test_bad_tools_call_params_32602` (5 cases)
 - `test_unknown_method_denied` (4 cases)
+- `test_unknown_method_notification_is_400_in_both_eras`
 - `test_notifications_prefix_allowed`
 - `test_mirrored_header_mismatch`
 - `test_mirrored_header_uri_and_prompts`
@@ -494,9 +500,10 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_mirrored_header_bad_encoding_is_mismatch` (2 cases)
 - `test_mirrored_header_non_ascii_bytes_is_mismatch_not_exception`
 - `test_mirrored_header_bad_params_is_mismatch`
-- `test_protocol_era`
+- `test_protocol_era` (9 cases)
 - `test_audit_event_is_single_escaped_json_line`
 - `test_audit_event_never_raises_on_odd_values`
+- `test_audit_event_unserializable_fields_fallback` (2 cases)
 - `test_safe_name_caps_at_64`
 - `test_safe_name_escapes_control_and_format_chars`
 
@@ -513,4 +520,3 @@ Test names by file (parametrized tests are abbreviated to one line with the case
 - `test_main_honours_audience_and_issuer_env`
 - `test_main_missing_secret_exits_2`
 - `test_main_short_secret_exits_2`
-
