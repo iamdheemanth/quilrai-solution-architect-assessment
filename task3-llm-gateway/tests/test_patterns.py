@@ -57,9 +57,31 @@ def test_constants():
     assert REPL == "[REDACTED]"
     assert (K, R) == (1, 2)
     assert COMBINED == f"(?P<EMAIL>{EMAIL})|(?P<SSN>{SSN})|(?P<CC>{CC})"
-    assert P_ARGS.pattern == rf"(?<![\\])(?:{COMBINED})"
+    guard = r"(?:(?<![\\])|(?<=[\\])(?![nrtbfu/\"\\]))"
+    assert P_ARGS.pattern == guard + "(?:" + COMBINED + ")"
     assert Q.pattern == f"(?:{COMBINED})(?!)"
-    assert Q_ARGS.pattern == rf"(?:(?<![\\])(?:{COMBINED}))(?!)"
+    assert Q_ARGS.pattern == "(?:" + P_ARGS.pattern + ")(?!)"
+
+
+BS = chr(92)
+GUARD_CASES = [
+    (json.dumps({"p": BS + "a@b.co"}), json.dumps({"p": BS + "[REDACTED]"})),
+    (json.dumps({"p": "x" + BS + "123-45-6789"}), json.dumps({"p": "x" + BS + "[REDACTED]"})),
+    (json.dumps({"p": BS + "4111111111111111"}), json.dumps({"p": BS + "[REDACTED]"})),
+    (json.dumps({"note": "Contact:\njohn@x.com"}), json.dumps({"note": "Contact:\n[REDACTED]"})),
+    (
+        json.dumps({"path": "C:" + BS + "Users" + BS + "123-45-6789.txt"}),
+        json.dumps({"path": "C:" + BS + "Users" + BS + "[REDACTED].txt"}),
+    ),
+    (json.dumps({"x": "\t123-45-6789"}), json.dumps({"x": "\t[REDACTED]"})),
+]
+
+
+@pytest.mark.parametrize(("raw", "expected"), GUARD_CASES)
+def test_args_guard_after_escaped_backslash(raw, expected):
+    out = batch_redact(raw, args=True)
+    assert out == expected
+    json.loads(out)
 
 
 def test_tool_args_keep_json_valid():

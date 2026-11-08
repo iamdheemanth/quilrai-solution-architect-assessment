@@ -2,9 +2,12 @@
 
 Invariant: ``"".join(feed(d) for d in deltas) + close()`` equals ``batch_redact(text)`` for any
 split of the text. A pending match is released only when it is final: it must (1) start before
-any still-growing partial match (Q search), (2) end at least R chars before the buffer end so
-negative lookaheads are settled (+R margin), and (3) not be a prefix of a longer match
-(``fullmatch(partial=True)``). Text before the earliest possible match start is emitted at once.
+any still-growing partial match (the separate Q partial search), (2) end at least R chars before
+the buffer end (+R margin), and (3) not be a prefix of a longer match
+(``fullmatch(partial=True)``). The separate Q partial search is necessary (dropping it leaks);
+the fullmatch check and +R margin are redundant safeguards given Q, kept as defence in depth
+against regex partial-mode semantics (assumption A4). Text before the earliest possible match
+start is emitted at once.
 """
 
 from collections import Counter
@@ -25,7 +28,7 @@ class StreamRedactor:
     """
 
     def __init__(self, args: bool = False, max_hold: int = 1024, *, _skip=frozenset()):
-        # _skip is test-only: names finality checks to disable (or q_naive) for mutation tests.
+        # _skip is test-only: names finality checks to disable for mutation tests.
         self._p = P_ARGS if args else P
         self._q = Q_ARGS if args else Q
         self._max_hold = max_hold
@@ -65,9 +68,6 @@ class StreamRedactor:
                 continue
             if "q_search" in skip:
                 s2 = n
-            elif "q_naive" in skip:  # test-only: plain partial search, blind to lookahead-at-end
-                q = self._p.search(buf, c, partial=True)
-                s2 = q.start() if q is not None and q.partial else n
             else:
                 q = self._q.search(buf, c, partial=True)  # leftmost partial match
                 s2 = q.start() if q else n

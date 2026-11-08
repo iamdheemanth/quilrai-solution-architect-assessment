@@ -26,14 +26,16 @@ COMBINED = rf"(?P<EMAIL>{EMAIL})|(?P<SSN>{SSN})|(?P<CC>{CC})"
 K = 1  # max lookbehind width before a match
 R = 2  # max lookahead width after a match
 
-# Tool-argument channels hold JSON-escaped text: a match may not start right after a backslash.
-_GUARD = r"(?<![\\])"
+# Tool-argument channels hold JSON-escaped text. A match may start after a backslash only if
+# its first char is not a JSON escape letter (so '\n' + 'john@x.com' is safe, while the second
+# backslash of an escaped '\\' does not block a match). Lookbehind stays 1 char (K).
+_GUARD = r"(?:(?<![\\])|(?<=[\\])(?![nrtbfu/\"\\]))"
 
 P = regex.compile(COMBINED)
 # Can never complete, so a partial=True search yields only true partial matches.
 Q = regex.compile(rf"(?:{COMBINED})(?!)")
 P_ARGS = regex.compile(rf"{_GUARD}(?:{COMBINED})")
-Q_ARGS = regex.compile(rf"(?:{_GUARD}(?:{COMBINED}))(?!)")
+Q_ARGS = regex.compile(rf"(?:{P_ARGS.pattern})(?!)")
 
 
 def luhn_ok(digits: str) -> bool:

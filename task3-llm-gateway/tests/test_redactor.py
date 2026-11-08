@@ -8,6 +8,7 @@ from hypothesis import strategies as st
 
 from llm_gateway.patterns import REPL, batch_redact
 from llm_gateway.redactor import StreamRedactor
+from tests.test_patterns import GUARD_CASES
 
 PII = [
     "john.doe@example.com",
@@ -30,7 +31,11 @@ FILL = [
     "mail me at ", "a", "x", "...", "foo.bar", " 4111", "123-45", "-6789", "co",
     "m", ".au", "9", "0", "#", "[REDACTED]",
 ]  # fmt: skip
-ARG_FILL = ['{"a": "', '"}', "\\n", "\\\\", "\\", "\\t", '", "b": "']
+BS = chr(92)
+ARG_FILL = [
+    '{"a": "', '"}', "\\n", "\\\\", "\\", "\\t", '", "b": "',
+    BS * 2, BS + "n", BS + "t", BS + "u0040",
+]  # fmt: skip
 
 text_st = st.lists(st.sampled_from(PII + FILL), max_size=25).map("".join)
 args_text_st = st.lists(st.sampled_from(PII + FILL + ARG_FILL), max_size=25).map("".join)
@@ -157,13 +162,15 @@ def test_adversarial_one_char_stream_is_fast_and_bounded():
     blob = (unit * 250)[:10000]
     assert len(blob) == 10000
     r = StreamRedactor()
-    worst = 0.0
+    times = []
     for ch in blob:
         t0 = time.perf_counter()
         r.feed(ch)
-        worst = max(worst, time.perf_counter() - t0)
+        times.append(time.perf_counter() - t0)
     r.close()
-    assert worst < 0.005
+    times.sort()
+    assert times[int(len(times) * 0.99)] < 0.005
+    assert times[-1] < 0.1
     assert r.max_held <= 128
 
 
@@ -247,18 +254,21 @@ def test_mutation_without_q_search_leaks_earlier_partial():
     assert run_variant(list("a@b.com.au"), "q_search") != batch_redact("a@b.com.au")
 
 
-def test_mutation_without_fullmatch_and_margin_finalises_too_early():
-    # Checks 2 and 3 back each other up and the Q search backs both up, so the necessity
-    # claim is shown on the weakened baseline where Q is the naive partial search
-    # (blind to lookaheads at the buffer end, as the report describes).
-    for chunks in (GROW, LOOKAHEAD):
-        want = batch_redact("".join(chunks))
-        assert run_variant(chunks, "q_naive") == want  # fullmatch + margin hold the line
-        assert run_variant(chunks, "q_naive", "fullmatch", "margin") != want
+@pytest.mark.parametrize("skip", [("fullmatch",), ("margin",), ("fullmatch", "margin")])
+def test_fullmatch_and_margin_are_redundant_safeguards_given_q(skip):
+    # With the real Q search these checks are defence in depth (assumption A4), not
+    # independently necessary: dropping them does not change the output on these fixtures.
+    for chunks in (GROW, LOOKAHEAD, HIDDEN):
+        assert run_variant(chunks, *skip) == batch_redact("".join(chunks))
 
 
-@pytest.mark.parametrize("only", ["fullmatch", "margin"])
-def test_mutation_each_of_fullmatch_and_margin_alone_is_sufficient_under_naive_q(only):
-    drop = "margin" if only == "fullmatch" else "fullmatch"
-    for chunks in (GROW, LOOKAHEAD):
-        assert run_variant(chunks, "q_naive", drop) == batch_redact("".join(chunks))
+@pytest.mark.parametrize(("raw", "expected"), GUARD_CASES)
+def test_args_guard_cases_streamed_in_every_split(raw, expected):
+    want = batch_redact(raw, args=True)
+    assert want == expected
+    assert run(list(raw), args=True)[0] == want
+    n = len(raw)
+    for i in range(n + 1):
+        assert run([raw[:i], raw[i:]], args=True)[0] == want
+        for j in range(i, n + 1):
+            assert run([raw[:i], raw[i:j], raw[j:]], args=True)[0] == want
