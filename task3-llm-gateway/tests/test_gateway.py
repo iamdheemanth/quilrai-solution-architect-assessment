@@ -346,3 +346,214 @@ async def test_timeout_and_bad_gateway_outcomes_logged(caplog):
     assert len(msgs) == 2
     assert "outcome=timeout" in msgs[0]
     assert "outcome=bad_gateway" in msgs[1]
+
+
+# ---- fix round 1: content-based JSON redaction ----
+
+
+@pytest.mark.parametrize(
+    ("status", "obj", "check"),
+    [
+        (500, {"error": "bad joe@example.com"}, lambda j: j["error"] == "bad [REDACTED]"),
+        (
+            422,
+            {"detail": [{"input": "joe@example.com", "loc": ["body"]}]},
+            lambda j: j["detail"][0]["input"] == "[REDACTED]" and j["detail"][0]["loc"] == ["body"],
+        ),
+        (
+            200,
+            {"error": {"message": "bad joe@example.com"}},
+            lambda j: j["error"]["message"] == "bad [REDACTED]",
+        ),
+        (
+            500,
+            {"choices": [{"message": {"content": "joe@example.com"}}]},
+            lambda j: j["choices"][0]["message"]["content"] == "[REDACTED]",
+        ),
+        (302, {"error": "joe@example.com"}, lambda j: j["error"] == "[REDACTED]"),
+    ],
+)
+async def test_every_json_reply_redacted_by_content_status_preserved(status, obj, check):
+    async with gateway(lambda req: json_response(obj, status)) as (c, _):
+        r = await post(c)
+    assert r.status_code == status
+    assert check(r.json())
+    assert "joe@example.com" not in r.text
+
+
+async def test_normal_completion_non_pii_fields_unchanged():
+    obj = {
+        "id": "chatcmpl-1",
+        "model": "m",
+        "created": 5,
+        "usage": {"prompt_tokens": 1, "total_tokens": 3},
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+    }
+    async with gateway(lambda req: json_response(obj)) as (c, _):
+        r = await post(c)
+    assert r.json() == obj
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"choices": 5}',
+        b'{"choices":[{"message":{"tool_calls":7}}]}',
+        b"[" * 50000 + b"]" * 50000,
+        b'{"a":' * 100 + b"1" + b"}" * 100,
+        b"not json",
+        b"[1]",
+    ],
+)
+async def test_malformed_json_is_502_logged(raw, caplog):
+    resp = httpx2.Response(
+        200, headers={"content-type": "application/json"}, stream=StreamBody([raw])
+    )
+    with caplog.at_level(logging.DEBUG, logger="llm_gateway"):
+        async with gateway(lambda req: resp) as (c, _):
+            r = await post(c)
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "bad_gateway"
+    assert len(_records(caplog)) == 1
+    assert "outcome=bad_gateway" in _records(caplog)[0].getMessage()
+
+
+async def test_missing_content_type_is_502():
+    resp = httpx2.Response(200, stream=StreamBody([b"{}"]))
+    async with gateway(lambda req: resp) as (c, _):
+        r = await post(c)
+    assert r.status_code == 502
+
+
+# ---- fix round 1: front door ----
+
+
+async def test_trailing_slash_is_404_not_redirect():
+    async with gateway(lambda req: json_response({})) as (c, calls):
+        r = await c.post("/v1/chat/completions/", content=b"{}")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+    assert calls == []
+
+
+# ---- fix round 1: headers ----
+
+
+async def test_client_credentials_and_named_connection_headers_stripped():
+    async with gateway(lambda req: json_response({"choices": []})) as (c, calls):
+        await post(
+            c,
+            headers={
+                "x-api-key": "k1",
+                "api-key": "k2",
+                "proxy-authorization": "Basic zzz",
+                "connection": "x-hop",
+                "x-hop": "1",
+                "x-keep": "1",
+            },
+        )
+    h = calls[0].headers
+    for name in ("x-api-key", "api-key", "proxy-authorization", "x-hop", "connection"):
+        assert name not in h
+    assert h["x-keep"] == "1"
+
+
+# ---- fix round 1: exactly one log record of any level ----
+
+
+def _scenarios():
+    err_json = lambda req: json_response({"error": {"message": "m"}}, 400)  # noqa: E731
+    mid = lambda req: sse_response(  # noqa: E731
+        [sse(chunk("x", role="assistant"))], error=httpx2.ReadError("d")
+    )
+    bad = lambda req: httpx2.Response(  # noqa: E731
+        200, headers={"content-type": "application/json"}, stream=StreamBody([b'{"choices":5}'])
+    )
+    ok_json = lambda req: json_response({"choices": []})  # noqa: E731
+
+    async def stream(c):
+        await post(c, b"{}")
+
+    return [
+        ("ok_stream", {"mock": build_mock_app()}, stream, "outcome=ok"),
+        ("ok_json", {"upstream": ok_json}, stream, "outcome=ok"),
+        ("upstream_error", {"upstream": err_json}, stream, "outcome=upstream_error"),
+        ("404", {"upstream": ok_json}, lambda c: c.post("/nope"), "outcome=not_found"),
+        (
+            "405",
+            {"upstream": ok_json},
+            lambda c: c.get("/v1/chat/completions"),
+            "outcome=method_not_allowed",
+        ),
+        (
+            "slash",
+            {"upstream": ok_json},
+            lambda c: c.post("/v1/chat/completions/"),
+            "outcome=not_found",
+        ),
+        (
+            "413",
+            {"upstream": ok_json},
+            lambda c: post(c, b"x" * (5 * 1024 * 1024)),
+            "outcome=payload_too_large",
+        ),
+        (
+            "502",
+            {"upstream": _raise(httpx2.ConnectError("c"))},
+            stream,
+            "outcome=bad_gateway error=ConnectError",
+        ),
+        (
+            "504",
+            {"upstream": _raise(httpx2.ReadTimeout("t"))},
+            stream,
+            "outcome=timeout error=ReadTimeout",
+        ),
+        ("mid_stream", {"upstream": mid}, stream, "outcome=stream_failed error=ReadError"),
+        ("malformed", {"upstream": bad}, stream, "outcome=bad_gateway error=TypeError"),
+    ]
+
+
+@pytest.mark.parametrize("scenario", _scenarios(), ids=lambda s: s[0])
+async def test_exactly_one_record_of_any_level_per_request(scenario, caplog):
+    _, kwargs, action, expected = scenario
+    up = kwargs.get("upstream")
+    with caplog.at_level(logging.DEBUG):
+        async with gateway(up, mock=kwargs.get("mock")) as (c, _):
+            await action(c)
+    recs = [r for r in caplog.records if r.name.startswith("llm_gateway")]
+    assert len(recs) == 1
+    msg = recs[0].getMessage()
+    assert expected in msg
+    assert "/nope" not in msg and "duration_ms=" in msg and "route=" in msg
+
+
+async def test_front_door_duration_measured_and_path_not_logged(caplog):
+    with caplog.at_level(logging.INFO, logger="llm_gateway"):
+        async with gateway(lambda req: json_response({})) as (c, _):
+            await c.post("/secret-path-123")
+    msg = _records(caplog)[0].getMessage()
+    assert "secret-path-123" not in msg
+    assert "route=unknown" in msg
+    assert "duration_ms=0.0" not in msg
+
+
+async def test_upstream_3xx_json_relayed_redacted():
+    async with gateway(lambda req: json_response({"error": "see joe@example.com"}, 307)) as (c, _):
+        r = await post(c)
+    assert r.status_code == 307
+    assert r.json() == {"error": "see [REDACTED]"}
+
+
+async def test_client_disconnect_outcome_and_upstream_closed():
+    from llm_gateway.proxy import relay
+    from llm_gateway.transform import StreamTransformer
+
+    stream = StreamBody([sse(chunk("a", role="assistant")), sse(chunk("b"))])
+    up = httpx2.Response(200, headers=SSE_CT, stream=stream)
+    seen = []
+    gen = relay(up, StreamTransformer(), lambda outcome, error: seen.append((outcome, error)))
+    await gen.__anext__()
+    await gen.aclose()
+    assert seen == [("client_disconnected", None)]
+    assert stream.closed

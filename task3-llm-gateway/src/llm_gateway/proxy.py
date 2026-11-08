@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .sse import SSEParser
-from .transform import ERROR_FRAME, StreamTransformer, redact_completion, redact_error_body
+from .transform import ERROR_FRAME, StreamTransformer, redact_json_body
 
 logger = logging.getLogger("llm_gateway")
 
@@ -32,6 +32,8 @@ HOP_BY_HOP = frozenset(
 REQUEST_DROP = HOP_BY_HOP | frozenset(
     {
         b"authorization",
+        b"x-api-key",
+        b"api-key",
         b"cookie",
         b"host",
         b"content-length",
@@ -66,23 +68,31 @@ def filter_request_headers(raw: list[tuple[bytes, bytes]]) -> list[tuple[bytes, 
     return out
 
 
+ROUTE = "chat_completions"
+
+
 def log_request(
     method: str,
-    path: str,
+    route: str,
     status: int | None,
     outcome: str,
     started: float,
     stats: dict | None = None,
+    error: str | None = None,
 ) -> None:
-    """One INFO line per request: metadata and redaction counts only, never content."""
+    """The one INFO line per request: metadata and redaction counts only, never content.
+
+    ``route`` is a fixed label, never the client-supplied path.
+    """
     stats = stats or {}
     logger.info(
-        "request method=%s path=%s upstream_status=%s outcome=%s redactions=%s "
+        "request method=%s route=%s upstream_status=%s outcome=%s error=%s redactions=%s "
         "max_held=%d duration_ms=%.1f",
         method,
-        path,
+        route,
         status if status is not None else "-",
         outcome,
+        error or "-",
         json.dumps(stats.get("counts", {}), sort_keys=True),
         stats.get("max_held", 0),
         (time.perf_counter() - started) * 1000,
@@ -100,11 +110,12 @@ class ClosingStreamingResponse(StreamingResponse):
 async def relay(
     upstream: httpx2.Response,
     tx: StreamTransformer,
-    on_done: Callable[[str], None] | None = None,
+    on_done: Callable[[str, str | None], None] | None = None,
 ) -> AsyncIterator[bytes]:
     """Redact an upstream SSE body; fail closed with an error frame on any exception."""
     parser = SSEParser()
-    outcome = "stream_failed"
+    outcome = "client_disconnected"  # still set if cancelled / closed at a yield
+    error: str | None = None
     try:
         async for raw in upstream.aiter_bytes():
             out = b"".join(tx.on_event(ev) for ev in parser.feed(raw))
@@ -113,19 +124,22 @@ async def relay(
             if tx.done:
                 break
         tail = tx.on_eof()
+        outcome = "stream_failed" if tail == ERROR_FRAME else "ok"
         if tail:
             yield tail
-        if tail != ERROR_FRAME:
-            outcome = "upstream_error" if upstream.status_code >= 400 else "ok"
+        if outcome == "ok" and upstream.status_code >= 400:
+            outcome = "upstream_error"
     except Exception as exc:  # transport drop, parse error, bad frame: never log content
-        logger.warning("stream failed closed: %s", type(exc).__name__)
+        outcome, error = "stream_failed", type(exc).__name__
         tx.discard()
         yield ERROR_FRAME
     finally:
-        with anyio.CancelScope(shield=True):
-            await upstream.aclose()
-        if on_done is not None:
-            on_done(outcome)
+        try:
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+        finally:
+            if on_done is not None:
+                on_done(outcome, error)
 
 
 async def _read_capped(upstream: httpx2.Response, cap: int) -> bytes | None:
@@ -145,12 +159,20 @@ async def proxy_endpoint(request: Request) -> Response:
     started = time.perf_counter()
     client: httpx2.AsyncClient = request.app.state.upstream
     settings = request.app.state.settings
-    method, path = request.method, request.url.path
+    method = request.method
 
-    def done(status: int | None, outcome: str, stats: dict | None = None) -> None:
-        log_request(method, path, status, outcome, started, stats)
+    def done(
+        status: int | None, outcome: str, stats: dict | None = None, error: str | None = None
+    ) -> None:
+        log_request(method, ROUTE, status, outcome, started, stats, error)
 
-    body = await request.body()
+    try:
+        body = await request.body()
+    except Exception as exc:  # body limit exceeded (Starlette answers 413) or client gone
+        name = type(exc).__name__
+        too_large = "TooLarge" in name or "LimitResponseSent" in name
+        done(None, "payload_too_large" if too_large else "client_disconnected", error=name)
+        raise
     url = settings.upstream_base_url.rstrip("/") + "/chat/completions"
     query = request.scope.get("query_string", b"").decode("latin-1")
     if query:
@@ -165,12 +187,10 @@ async def proxy_endpoint(request: Request) -> Response:
     try:
         upstream = await client.send(up_req, stream=True)
     except httpx2.TimeoutException as exc:  # subclass of TransportError: catch first
-        logger.warning("upstream call failed: %s", type(exc).__name__)
-        done(None, "timeout")
+        done(None, "timeout", error=type(exc).__name__)
         return openai_error(504, "Upstream timeout", "upstream_error", "upstream_timeout")
     except httpx2.TransportError as exc:
-        logger.warning("upstream call failed: %s", type(exc).__name__)
-        done(None, "bad_gateway")
+        done(None, "bad_gateway", error=type(exc).__name__)
         return openai_error(502, "Upstream unavailable", "upstream_error", "upstream_unavailable")
 
     status = upstream.status_code
@@ -179,31 +199,34 @@ async def proxy_endpoint(request: Request) -> Response:
     if media == "text/event-stream":
         tx = StreamTransformer()
 
-        def finish(outcome: str) -> None:
-            done(status, outcome, tx.stats())
+        def finish(outcome: str, error: str | None) -> None:
+            done(status, outcome, tx.stats(), error)
 
         return ClosingStreamingResponse(
             relay(upstream, tx, finish), status_code=status, headers=SSE_HEADERS
         )
 
+    error = "UnsupportedContentType"
     try:
         if media == "application/json" or media.endswith("+json"):
             raw = await _read_capped(upstream, settings.max_body_bytes)
-            if raw is not None:
+            if raw is None:
+                error = "BodyTooLarge"
+            else:
                 obj = json.loads(raw)
-                if isinstance(obj, dict):
-                    obj = redact_completion(obj) if status < 400 else redact_error_body(obj)
-                    outcome = "ok" if status < 400 else "upstream_error"
-                    done(status, outcome)
+                if not isinstance(obj, dict):
+                    error = "NotAnObject"
+                else:
+                    obj = redact_json_body(obj)
+                    done(status, "ok" if status < 400 else "upstream_error")
                     return JSONResponse(obj, status_code=status)
     except httpx2.TimeoutException as exc:
-        logger.warning("upstream call failed: %s", type(exc).__name__)
-        done(status, "timeout")
+        done(status, "timeout", error=type(exc).__name__)
         return openai_error(504, "Upstream timeout", "upstream_error", "upstream_timeout")
-    except (httpx2.TransportError, ValueError) as exc:
-        logger.warning("upstream body unusable: %s", type(exc).__name__)
+    except Exception as exc:  # transport error, bad JSON, malformed shape, RecursionError
+        error = type(exc).__name__
     finally:
         with anyio.CancelScope(shield=True):
             await upstream.aclose()
-    done(status, "bad_gateway")
+    done(status, "bad_gateway", error=error)
     return openai_error(502, "Invalid upstream response", "upstream_error", "bad_gateway")

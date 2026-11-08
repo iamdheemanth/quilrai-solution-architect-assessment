@@ -266,9 +266,27 @@ def redact_completion(obj: dict) -> dict:
     return out
 
 
+_MAX_DEPTH = 64
+
+
+def _redact_leaves(value, depth: int = 0):
+    """Batch-redact every string leaf (dict values, list items); keys are untouched."""
+    if depth > _MAX_DEPTH:
+        raise ValueError("JSON nesting too deep")
+    if isinstance(value, str):
+        return batch_redact(value)
+    if isinstance(value, dict):
+        return {k: _redact_leaves(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_leaves(v, depth + 1) for v in value]
+    return value
+
+
+def redact_json_body(obj: dict) -> dict:
+    """Redact any JSON reply by content: completion semantics for ``choices``, plus every
+    other string leaf. Raises on malformed shapes or excessive nesting (caller fails closed)."""
+    return _redact_leaves(redact_completion(obj))
+
+
 def redact_error_body(obj: dict) -> dict:
-    out = copy.deepcopy(obj)
-    err = out.get("error")
-    if isinstance(err, dict) and isinstance(err.get("message"), str):
-        err["message"] = batch_redact(err["message"])
-    return out
+    return redact_json_body(obj)
