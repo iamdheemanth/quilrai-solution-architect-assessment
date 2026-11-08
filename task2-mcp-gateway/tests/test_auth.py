@@ -1,5 +1,7 @@
 import base64
+import hashlib
 import json
+import re
 import time
 import warnings
 
@@ -114,6 +116,12 @@ def test_static_verifier():
     assert principal.role == "viewer"
     assert principal.subject.startswith("static:") and len(principal.subject) == len("static:") + 12
     assert sv.verify("tok-admin").role == "admin"
+    assert re.fullmatch(r"static:[0-9a-f]{12}", principal.subject)
+    assert sv.verify("tok-view").subject == principal.subject  # stable within one verifier
+    assert sv.verify("tok-admin").subject != principal.subject
+    # Keyed per process: a dictionary guess of the token cannot be confirmed from the log.
+    assert principal.subject != "static:" + hashlib.sha256(b"tok-view").hexdigest()[:12]
+    assert StaticVerifier({"tok-view": "viewer"}).verify("tok-view").subject != principal.subject
     with pytest.raises(AuthError) as e:
         sv.verify("unknown-secret-token")
     assert (e.value.status, e.value.www_authenticate) == (401, INVALID_TOKEN)

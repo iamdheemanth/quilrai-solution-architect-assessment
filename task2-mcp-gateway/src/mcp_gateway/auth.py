@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -90,6 +91,8 @@ class JwtVerifier:
 class StaticVerifier:
     def __init__(self, tokens: Mapping[str, Role]) -> None:
         self._tokens = [(t.encode("utf-8"), r) for t, r in tokens.items()]
+        # Keyed per process so a guessed token cannot be confirmed against an audit subject.
+        self._subject_key = secrets.token_bytes(32)
 
     def verify(self, token: str) -> Principal:
         presented = token.encode("utf-8")
@@ -99,7 +102,7 @@ class StaticVerifier:
                 matched = role
         if matched is None:
             raise _invalid_token("unknown_token")
-        digest = hashlib.sha256(presented).hexdigest()[:12]
+        digest = hmac.new(self._subject_key, presented, hashlib.sha256).hexdigest()[:12]
         return Principal(f"static:{digest}", matched)
 
 
