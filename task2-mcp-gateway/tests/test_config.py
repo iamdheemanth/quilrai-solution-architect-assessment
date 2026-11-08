@@ -74,6 +74,22 @@ def test_errors_never_leak_token_values():
     assert "dup-tok" not in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "url", ["127.0.0.1:8001/mcp", "ftp://x/mcp", "http:///mcp", "http://h:99999/mcp"]
+)
+def test_downstream_url_must_be_http_with_host(url):
+    with pytest.raises(ConfigError, match="GATEWAY_DOWNSTREAM_URL"):
+        load_settings({"GATEWAY_JWT_SECRET": SECRET, "GATEWAY_DOWNSTREAM_URL": url})
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:8001/mcp", "https://mcp.internal/mcp", "http://h"]
+)
+def test_downstream_url_accepted(url):
+    s = load_settings({"GATEWAY_JWT_SECRET": SECRET, "GATEWAY_DOWNSTREAM_URL": url})
+    assert s.downstream_url == url
+
+
 def test_deny_status_403_opt_in():
     s = load_settings({"GATEWAY_JWT_SECRET": SECRET, "GATEWAY_DENY_HTTP_STATUS": "403"})
     assert s.deny_http_status == 403

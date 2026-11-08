@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlsplit
 
 Role = Literal["admin", "viewer"]
 AuthMode = Literal["jwt", "static"]
@@ -62,6 +63,20 @@ def _int(env: Mapping[str, str], name: str, default: int, low: int, high: int | 
     return value
 
 
+def _downstream_url(env: Mapping[str, str]) -> str:
+    name = "GATEWAY_DOWNSTREAM_URL"
+    url = _text(env, name, Settings.downstream_url)
+    try:
+        parts = urlsplit(url)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+        _ = parts.port  # raises ValueError for an out-of-range or non-numeric port
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f"{name} must be an http:// or https:// URL with a host")
+    return url
+
+
 def _parse_static_tokens(raw: str) -> dict[str, Role]:
     name = "GATEWAY_STATIC_TOKENS"
     fmt = "token=role[,token=role] with role admin or viewer, unique non-empty tokens"
@@ -98,7 +113,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         static_tokens = _parse_static_tokens(env.get("GATEWAY_STATIC_TOKENS", ""))
     deny = _choice(env, "GATEWAY_DENY_HTTP_STATUS", "200", tuple(str(s) for s in _DENY_STATUSES))
     return Settings(
-        downstream_url=_text(env, "GATEWAY_DOWNSTREAM_URL", Settings.downstream_url),
+        downstream_url=_downstream_url(env),
         host=_text(env, "GATEWAY_HOST", Settings.host),
         port=_int(env, "GATEWAY_PORT", Settings.port, 1, 65535),
         auth_mode=auth_mode,  # type: ignore[arg-type]
