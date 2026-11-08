@@ -37,7 +37,7 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). All commands run from
 
 ```bash
 uv sync --locked
-uv run pytest -q          # 200 tests, about 2 s
+uv run pytest -q          # 238 tests, about 2 s
 ```
 
 The demo needs three terminals (or run the two servers in the background). The secret below is a placeholder; any value of 32 bytes or more works, and the gateway refuses to start with a shorter one.
