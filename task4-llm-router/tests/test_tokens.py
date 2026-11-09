@@ -53,6 +53,19 @@ def test_empty_messages():
     assert fwd["max_tokens"] == 50
 
 
+def test_explicit_zero_max_tokens_is_honoured_not_defaulted():
+    est, fwd = estimate_tokens({"messages": MSGS, "max_tokens": 0}, 1024)
+    assert est == 16 + 0
+    assert fwd["max_tokens"] == 0
+
+
+def test_invalid_max_completion_tokens_rejected_even_with_valid_max_tokens():
+    body = {"messages": MSGS, "max_tokens": 10, "max_completion_tokens": "lots"}
+    with pytest.raises(InvalidRequest) as ei:
+        estimate_tokens(body, 1024)
+    assert ei.value.param == "max_completion_tokens"
+
+
 @pytest.mark.parametrize("bad", [-1, "100", 1.5, True])
 def test_invalid_max_tokens_rejected(bad):
     with pytest.raises(InvalidRequest) as ei:

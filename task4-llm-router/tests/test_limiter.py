@@ -224,6 +224,89 @@ def test_eviction_deletes_old_rows_for_that_tenant_only(lim, clock, db_path):
     assert got == [("a2",), ("a3",), ("b2",)]
 
 
+# ---------------------------------------------------------------- clock sampled under the lock
+
+
+def test_clock_is_read_only_inside_the_write_transaction(db_path):
+    """Regression: now_ms must be sampled after BEGIN IMMEDIATE, not before waiting for it."""
+    holder = {}
+    reads = []
+
+    def clock():
+        reads.append(holder["lim"]._conn.in_transaction)
+        return T0_MS / 1000
+
+    limiter = SqliteTokenLimiter(db_path, LIMIT, WINDOW, clock=clock)
+    holder["lim"] = limiter
+    try:
+        limiter.reserve("t", "a", LIMIT)  # admitted path
+        with pytest.raises(GatewayRateLimited):
+            limiter.reserve("t", "b", 1)  # rejected path
+    finally:
+        limiter.close()
+    assert reads == [True, True]
+
+
+def test_waiter_is_timestamped_at_admission_not_at_arrival(db_path):
+    """A reserve blocked on another connection's write lock uses the post-wait time."""
+    clock = FakeClock()
+    limiter = SqliteTokenLimiter(db_path, LIMIT, WINDOW, clock=clock)
+    other = sqlite3.connect(db_path, autocommit=True, timeout=5)
+    errors = []
+
+    def run():
+        try:
+            limiter.reserve("t", "late", 100)
+        except Exception as exc:  # surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    try:
+        other.execute("BEGIN IMMEDIATE")  # hold the write lock
+        worker.start()
+        worker.join(timeout=0.3)  # worker is now blocked on BEGIN IMMEDIATE
+        assert worker.is_alive()
+        clock.advance(4_000)  # time passes while it waits
+        other.execute("COMMIT")
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+    finally:
+        other.close()
+        limiter.close()
+    assert errors == []
+    assert rows(db_path, "SELECT ts_ms FROM usage WHERE request_id='late'") == [(T0_MS + 4_000,)]
+
+
+class _FailOnInsert:
+    """Connection proxy that raises a sqlite3.Error on INSERT, mid-transaction."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("INSERT"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_error_mid_transaction_rolls_back_and_connection_stays_usable(lim, db_path, clock):
+    lim.reserve("t", "old", 100)
+    clock.advance(60_000)  # "old" is evictable; the failed tx's DELETE must be rolled back
+    real = lim._conn
+    lim._conn = _FailOnInsert(real)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            lim.reserve("t", "x", 100)
+    finally:
+        lim._conn = real
+    assert real.in_transaction is False
+    assert rows(db_path, "SELECT request_id FROM usage") == [("old",)]  # DELETE rolled back
+    assert lim.reserve("t", "y", 100).remaining == LIMIT - 100
+
+
 # ---------------------------------------------------------------- concurrency
 
 
@@ -297,6 +380,8 @@ def test_processes_admit_exactly_floor_limit_over_est(db_path):
 
 
 def test_async_tasks_admit_exactly_floor_limit_over_est(db_path):
+    # Proves the async facade under many concurrent tasks. CapacityLimiter(1) already serializes
+    # the calls, so DB atomicity itself is proven by the thread and process tests above.
     now = T0_MS / 1000
     n_tasks, est = 200, 700
     sync = SqliteTokenLimiter(db_path, LIMIT, WINDOW, clock=lambda: now)

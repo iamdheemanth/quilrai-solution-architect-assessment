@@ -91,12 +91,14 @@ class SqliteTokenLimiter:
             raise ValueError("tokens must be >= 0")
         if tokens > self.limit:
             raise RequestExceedsRateLimit()
-        now_ms = self._now_ms()
-        cutoff = now_ms - self._window_ms
         with self._lock:
             c = self._conn
             c.execute("BEGIN IMMEDIATE")
             try:
+                # Sample the clock only once the write lock is held: a request that waited on
+                # the lock or busy_timeout is evicted and timestamped at its admission time.
+                now_ms = self._now_ms()
+                cutoff = now_ms - self._window_ms
                 c.execute("DELETE FROM usage WHERE tenant=? AND ts_ms<=?", (tenant, cutoff))
                 (used,) = c.execute(
                     "SELECT COALESCE(SUM(tokens), 0) FROM usage WHERE tenant=?", (tenant,)
@@ -115,8 +117,11 @@ class SqliteTokenLimiter:
                 c.execute("COMMIT")
             except BaseException:
                 if c.in_transaction:
-                    c.execute("ROLLBACK")
-                raise
+                    try:
+                        c.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        logger.warning("rate limiter rollback failed", exc_info=True)
+                raise  # always the original error, never the rollback's
         return Reservation(
             request_id=request_id,
             tokens=tokens,

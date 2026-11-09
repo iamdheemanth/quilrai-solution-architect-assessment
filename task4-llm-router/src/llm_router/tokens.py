@@ -17,14 +17,19 @@ from .errors import InvalidRequest
 
 
 def _completion_budget(body: dict[str, Any]) -> tuple[str, int] | None:
+    """First present of max_tokens, max_completion_tokens. Both are validated when present.
+
+    A present value of 0 is honoured as 0 (an explicit client choice), not treated as absent.
+    """
+    found: list[tuple[str, int]] = []
     for field in ("max_tokens", "max_completion_tokens"):
         value = body.get(field)
         if value is None:
             continue
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise InvalidRequest(f"'{field}' must be a non-negative integer", param=field)
-        return field, value
-    return None
+        found.append((field, value))
+    return found[0] if found else None
 
 
 def estimate_tokens(body: dict[str, Any], default_max_tokens: int) -> tuple[int, dict[str, Any]]:
