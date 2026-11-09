@@ -212,8 +212,8 @@ def test_counts_by_type():
 
 def test_rejected_matches_not_counted():
     r = StreamRedactor()
-    out = r.feed("000-12-3456 ") + r.close()
-    assert out == "000-12-3456 "
+    out = r.feed("4111111111111112 ") + r.close()
+    assert out == "4111111111111112 "
     assert sum(r.counts.values()) == 0
 
 

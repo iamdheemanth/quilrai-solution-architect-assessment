@@ -38,7 +38,7 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). All commands run from
 
 ```bash
 uv sync --locked
-uv run pytest -q          # 262 tests, about 60 to 80 s (one slow property test dominates)
+uv run pytest -q          # 266 tests, about 60 to 80 s (one slow property test dominates)
 ```
 
 ### bash
@@ -169,8 +169,8 @@ All three are combined into one regex, in this order, so matches never overlap (
 | Type | Matches | Validator (a rejected match is emitted verbatim) |
 |---|---|---|
 | EMAIL | `local@label.label...tld`: local part up to 64 chars of `[A-Za-z0-9._%+-]`, 1 to 8 labels of up to 63 chars, alphabetic TLD of 2 to 63; may not be followed by a label character or `.label` | none |
-| SSN | hyphenated `ddd-dd-dddd` only, not adjacent to other digits | area not `000`, `666` or `900`-`999`; group not `00`; serial not `0000` |
-| CC | 13 to 19 digits as a plain run, `4-4-4-1..7` groups with `-` or space, or Amex `4-6-5` | separators stripped, 13 to 19 digits, Luhn check passes |
+| SSN | hyphenated `ddd-dd-dddd` only, not adjacent to other digits | none: any `ddd-dd-dddd` is redacted, including made-up and test values |
+| CC | 13 to 19 digits as a plain run, `4-4-4-1..7` groups with `-` or space, or Amex `4-6-5` | Luhn check applies only to an unseparated digit run; separated formats (`4-4-4-1..7`, Amex `4-6-5`) are always redacted |
 
 Replacement is exactly `[REDACTED]`. `a@b.com.` becomes `[REDACTED].` (a trailing period is not part of the email).
 
@@ -188,9 +188,8 @@ Per choice, each text channel has its own redactor, so `n > 1` choices never spl
 
 ### Not redacted, by design
 
-- SSNs with area `000`, `666` or `9xx` (which includes ITINs), group `00` or serial `0000`.
 - Unhyphenated 9-digit runs (ZIP+4 codes, order numbers and phone fragments collide with them).
-- Digit runs that are Luhn-invalid.
+- Unseparated digit runs that are Luhn-invalid (timestamps, order numbers).
 - In tool arguments: PII hidden behind a JSON `\uXXXX` escape (for example `\u0040` for `@`), and the one character that the escape guard cannot separate in cases such as `C:\\new@x.com` (the `n` after the backslash pair leaks).
 - PII in JSON object **keys** of error bodies (only string values are redacted).
 - Anything outside email, SSN and card patterns: names, addresses, phone numbers, API keys, free-text identifiers. Obfuscated forms (spelled out, fullwidth digits) are also out of scope.
@@ -331,12 +330,12 @@ LiteLLM's custom-guardrail API offers [`stream_holdback_chars`](https://docs.lit
 $ uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run pytest -q -W error
 All checks passed!
 24 files already formatted
-262 passed in 63.06s
+266 passed in 63.06s
 ```
 
-The pytest run takes about 60 to 80 s on the reference machine. Names below come from `uv run pytest --collect-only -q`; `(xN)` marks a parametrised test with N cases. The counts per file sum to 262.
+The pytest run takes about 60 to 80 s on the reference machine. Names below come from `uv run pytest --collect-only -q`; `(xN)` marks a parametrised test with N cases. The counts per file sum to 266.
 
-**tests/test_patterns.py (41)**: `test_batch_redact_table` (x21), `test_constants`, `test_args_guard_after_escaped_backslash` (x6), `test_tool_args_keep_json_valid`, `test_without_guard_escape_is_eaten`, `test_redos_bounded_time` (x4), `test_redaction_type_and_valid`, `test_luhn` (x6)
+**tests/test_patterns.py (45)**: `test_batch_redact_table` (x25), `test_constants`, `test_args_guard_after_escaped_backslash` (x6), `test_tool_args_keep_json_valid`, `test_without_guard_escape_is_eaten`, `test_redos_bounded_time` (x4), `test_redaction_type_and_valid`, `test_luhn` (x6)
 
 **tests/test_redactor.py (44)**: `test_property_stream_equals_batch`, `test_property_stream_equals_batch_args`, `test_exhaustive_splits` (x14), `test_no_leak_at_any_chunk_size` (x4), `test_bounded_hold_on_prose`, `test_ttft_immediate_release`, `test_worked_example`, `test_adversarial_one_char_stream_is_fast_and_bounded`, `test_cap_fails_closed`, `test_max_length_email_does_not_hit_default_cap`, `test_discard_drops_pending`, `test_counts_by_type`, `test_rejected_matches_not_counted`, `test_args_mode_does_not_eat_escape`, `test_max_held_is_high_water_after_feed`, `test_mutation_baseline_matches_batch` (x3), `test_mutation_without_q_search_leaks_earlier_partial`, `test_fullmatch_and_margin_are_redundant_safeguards_given_q` (x3), `test_args_guard_cases_streamed_in_every_split` (x6)
 
