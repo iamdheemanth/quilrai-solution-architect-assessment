@@ -18,7 +18,7 @@ How it maps to the three things this task is graded on:
 
 ```
                       +------------------------- llm-router :8004 --------------------------+
-                      |  authenticate: HMAC(pepper, key) -> tenant id    (401 invalid_api_key)|
+                      |  authenticate: HMAC(pepper, key) -> tenant id   (401 invalid_api_key)|
  client -- POST ----> |  read body (1 MiB cap), parse, reject stream:true (413 / 400)        |
  /v1/chat/completions |  estimate = ceil(len(messages JSON)/4) + max_tokens                  |
                       |  limiter.reserve  --- BEGIN IMMEDIATE, evict, sum, insert (SQLite)   |
@@ -103,7 +103,7 @@ The official OpenAI SDK works unmodified against the router (`OpenAI(base_url="h
 
 ### Demo output
 
-Real output from the setup above (primary mock in `rate_limit` mode, secondary `ok`, `ROUTER_TOKENS_PER_MINUTE=3000` so the limit is easy to hit, a temp database file). Request ids differ per run.
+Real output from the setup above (primary mock in `rate_limit` mode, secondary `ok`, `ROUTER_TOKENS_PER_MINUTE=3000` so the limit is easy to hit, a temp database file). Request ids differ per run. The demo ran on an ephemeral port (49809), which is why the URLs below differ from the quick start's port 8004.
 
 **A successful fallback.** The primary returned 429, the secondary served. The body is the mock's reply, relayed unchanged; the headers are the router's.
 
@@ -139,7 +139,7 @@ content-type: application/json
 {"error":{"message":"Rate limit exceeded for this API key. Retry after the time in the Retry-After header.","type":"rate_limit_error","param":null,"code":"gateway_rate_limited","request_id":"58802cefb27441a79b627ed1901296aa"}}
 ```
 
-`Retry-After` is the whole seconds until enough old rows age out of the window for this request to fit (here the first row was a few seconds old, so 56 of the 60). It is not a fixed guess.
+`Retry-After` is the whole seconds until enough old rows age out of the window for this request to fit (here the second 50-token row is the one that has to age out: freeing only the first still leaves 3010 > 3000, and that row was a few seconds old, so 56 of the 60). It is not a fixed guess.
 
 **Sanitized errors.** A wrong key, a `stream: true` request and a wrong method:
 
@@ -215,6 +215,8 @@ Reconcile and refund run shielded from cancellation, so a client that disconnect
 
 **Honest limit:** chars/4 is a rough estimate, not a tokenizer. It only has to be a reasonable reservation, because it is replaced by the provider's real count as soon as the answer arrives. A tiktoken estimator is listed under extensions.
 
+**Another honest limit:** a refund on a client disconnect or a timeout means the tenant is not charged for an upstream attempt that may still have generated (and been billed by the provider). The reservation only holds capacity while the request is in flight.
+
 ### Oversized requests
 
 A request whose estimate alone exceeds the whole budget could never be admitted, however long the client waited. A `Retry-After` for it would be a lie, so it gets a 400 `request_exceeds_rate_limit` with no `Retry-After` instead of a 429. No row is written.
@@ -276,7 +278,9 @@ The worst case is therefore two deadlines back to back (about 6 s with defaults)
 | timeout | secondary, `x-gateway-fallback-reason: timeout` |
 | any other 4xx or 5xx, connection error, malformed JSON | 502 `upstream_error`, **no failover** (the brief names only 429 and timeout) |
 
-If the secondary also fails: both 429 gives 429 `upstream_rate_limited` (`Retry-After: 1`); a timeout on either side with no success gives 504 `upstream_timeout`; any other failure gives 502 `upstream_error`. The primary's response is fully read and closed before the secondary starts.
+A 2xx whose JSON body holds a truthy `error` and no `choices` is not a success: it is treated like any other upstream error (502 `upstream_error`, refunded, no failover), and its text is never relayed. A body that has `choices` is relayed as usual.
+
+If the secondary also fails, **the secondary's outcome alone decides** the result, whatever the primary did: a 429 gives 429 `upstream_rate_limited` (`Retry-After: 1`), a timeout gives 504 `upstream_timeout`, anything else gives 502 `upstream_error`. So primary timeout then secondary 429 is a 429, primary timeout then secondary 5xx is a 502, and primary 429 or timeout then secondary timeout is a 504. The primary's response is fully read and closed before the secondary starts.
 
 ### The race conditions and how each is handled
 
@@ -284,7 +288,7 @@ If the secondary also fails: both 429 gives 429 `upstream_rate_limited` (`Retry-
 
 **Cancellation from outside is never failover.** Only the timeout exceptions are caught. A cancellation from outside (the client leaving) is not a timeout, so it propagates. When the primary fails, the router also calls `checkpoint_if_cancelled()` before starting the secondary, so a cancel that lands at the same moment as a primary timeout does not start a second upstream call (`test_cancel_landing_with_primary_timeout_never_starts_secondary`, `test_outer_cancellation_during_secondary_propagates`).
 
-**Client disconnect.** Starlette delivers no cancellation when the client goes away, so without help a client that left during a stalled primary would still trigger failover and be charged for it. A watcher task runs alongside `route`, reads the ASGI `http.disconnect` message, and cancels it. A client that leaves gets no failover and its reservation is refunded. The watcher only starts after the body is fully read, so it can never consume a body message. A result that was already produced is kept even if the disconnect lands at the same moment. The event appears in the log as `outcome=client_disconnected` with status 499; the client is gone, so nothing is sent, and that code never appears in a response. Tests: `test_disconnect_during_stalled_primary_stops_failover_and_refunds`, `test_watcher_leaves_a_normal_request_untouched`, and, with a real socket, `test_real_socket_close_during_stalled_primary_refunds_without_failover`.
+**Client disconnect.** Starlette delivers no cancellation when the client goes away, so without help a client that left during a stalled primary would still trigger failover and be charged for it. A watcher task runs alongside `route`, reads the ASGI `http.disconnect` message, and cancels it. A client that leaves gets no failover and its reservation is refunded. The watcher only starts after the body is fully read, so it can never consume a body message. A result that was already produced is kept even if the disconnect lands at the same moment. The event appears in the log as `outcome=client_disconnected` with status 499; the client is gone, so the 499 response goes to a closed socket and is never delivered. Tests: `test_disconnect_during_stalled_primary_stops_failover_and_refunds`, `test_watcher_leaves_a_normal_request_untouched`, and, with a real socket, `test_real_socket_close_during_stalled_primary_refunds_without_failover`.
 
 **Values that cannot be forwarded.** `json.loads` accepts `NaN`, `1e999` (which overflows to infinity) and lone surrogates, none of which can be re-encoded as strict JSON. A client body containing any of them gets a 400 before anything is reserved. The same value in an upstream 2xx body becomes a 502 with a refund and **no failover** (the upstream answered; the answer is the problem).
 
@@ -309,12 +313,12 @@ Every error, from every code path, is exactly this shape, with an `x-request-id`
 | Wrong method | 405 | `method_not_allowed` | JSON, with `Allow: POST` |
 | Estimate larger than the whole budget | 400 | `request_exceeds_rate_limit` | No `Retry-After` |
 | Tenant over its limit | 429 | `gateway_rate_limited` | `Retry-After`: whole seconds until the request would fit, at least 1 |
-| Both providers rate limited | 429 | `upstream_rate_limited` | `Retry-After: 1` |
-| Timeout with no successful answer | 504 | `upstream_timeout` | Primary 429 then secondary timeout, or both time out |
-| Upstream error, connection error, malformed or unrepresentable body, or secondary failure after failover | 502 | `upstream_error` | A primary non-429 error does not fail over |
+| Secondary rate limited after failover | 429 | `upstream_rate_limited` | `Retry-After: 1`. The secondary decides, so primary timeout then secondary 429 is also a 429 |
+| Secondary timed out after failover | 504 | `upstream_timeout` | Primary 429 or timeout, then secondary timeout |
+| Upstream error, connection error, malformed or unrepresentable body, a 2xx body carrying an `error` and no `choices`, or secondary 5xx after failover | 502 | `upstream_error` | A primary non-429 error does not fail over |
 | SQLite failure | 503 | `rate_limiter_unavailable` | Fails closed: no upstream call |
 | Anything else | 500 | `internal_error` | |
-| Client disconnected | 499 | `client_disconnected` | Log only; no client is left to receive it |
+| Client disconnected | 499 | `client_disconnected` | Log only; the response goes to a closed socket |
 
 ### Sanitization approach
 
@@ -359,16 +363,16 @@ uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv ru
 ```
 
 ```
-289 passed in 25.67s
+294 passed in 30.31s
 ```
 
-289 tests, all collected and all passing, with warnings treated as errors. By file:
+294 tests, all collected and all passing, with warnings treated as errors. By file:
 
 | File | Tests | Covers |
 |---|---|---|
 | `test_limiter.py` | 25 | exact admission at the limit, window boundary (+59,999 / +60,000 ms), sliding rather than fixed reset, eviction scoped to the tenant, reconcile and refund, `Retry-After` computation, restart persistence, raw key absent from the file, clock read inside the transaction, rollback on error, the 32x20 thread, 6-process and 200-task concurrency proofs, shielded refund, sanitized SQLite errors |
-| `test_router.py` | 35 | success, 429 failover, total deadline and trickling body, httpx2 timeout counted, the boundary race, outer cancellation (during primary, during secondary, landing with a timeout), every both-fail combination, no failover on a primary 5xx, malformed 2xx bodies, sanitized connect errors, exact forwarded request |
-| `test_app.py` | 84 | headers on success, single charge on failover, status and code for every row of the error table, 404, 405 and 413, 401 before body parsing, unforwardable bodies (400 and 502), disconnect and watcher behaviour, no canary in any response, exactly one INFO line, lifespan ownership, logging setup |
+| `test_router.py` | 38 | success, 429 failover, total deadline and trickling body, httpx2 timeout counted, the boundary race, outer cancellation (during primary, during secondary, landing with a timeout), every both-fail combination, no failover on a primary 5xx, malformed 2xx bodies and 2xx error bodies, sanitized connect errors, exact forwarded request |
+| `test_app.py` | 86 | headers on success, single charge on failover, status and code for every row of the error table, 404, 405 and 413, 401 before body parsing, unforwardable bodies (400 and 502), disconnect (including during the body read) and watcher behaviour, a 2xx error body as a sanitized 502, no canary in any response, exactly one INFO line, lifespan ownership, logging setup |
 | `test_e2e.py` | 12 | real sockets and the official OpenAI SDK: success, failover on 429 and on a slow or trickling primary, both 429, gateway 429 with `Retry-After`, leaky upstream, wrong key, real socket close mid-request, bad config exits 2 |
 | `test_tokens.py` | 12 | estimate formula, `max_tokens` precedence, default injection, explicit zero, invalid values |
 | `test_auth.py` | 24 | HMAC tenant id, header styles and precedence, invalid and non-ASCII keys, compares every key |

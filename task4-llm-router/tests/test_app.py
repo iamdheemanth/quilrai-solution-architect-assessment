@@ -681,6 +681,25 @@ async def test_body_at_exactly_the_limit_is_accepted(tmp_path):
 # --- cancellation ------------------------------------------------------------------------
 
 
+async def test_client_disconnect_during_body_read_is_a_499_not_a_500(tmp_path, caplog, monkeypatch):
+    from starlette.requests import ClientDisconnect
+
+    async def gone(request):
+        raise ClientDisconnect()
+
+    monkeypatch.setattr("llm_router.app._read_body", gone)
+    async with gateway(tmp_path) as gw:
+        with caplog.at_level(logging.INFO, logger="llm_router"):
+            resp = await gw.post()
+        rows = gw.rows()
+    assert resp.status_code == 499
+    assert gw.up.calls == []
+    assert rows == []
+    [info] = info_records(caplog)
+    assert " status=499 outcome=client_disconnected " in info.getMessage()
+    assert not [r for r in caplog.records if r.exc_info]
+
+
 async def test_client_disconnect_mid_route_refunds_the_reservation(tmp_path, caplog):
     flags = {"entered": anyio.Event()}
     async with gateway(
@@ -875,6 +894,27 @@ async def test_no_canary_in_any_response(tmp_path, monkeypatch, scenario):
     for canary in CANARIES:
         for surface in surfaces:
             assert canary not in surface, (scenario, canary)
+
+
+async def test_2xx_upstream_error_body_is_a_sanitized_502_and_refunded(tmp_path):
+    async def primary(request):
+        return httpx2.Response(200, json=LEAKY_BODY)
+
+    async with gateway(tmp_path, primary=primary) as gw:
+        resp = await gw.post()
+        rows = gw.rows()
+    assert resp.status_code == 502
+    body = resp.json()
+    assert set(body) == {"error"}
+    assert set(body["error"]) == {"message", "type", "param", "code", "request_id"}
+    assert body["error"]["code"] == "upstream_error"
+    assert resp.headers["x-request-id"] == body["error"]["request_id"]
+    surfaces = [resp.text, *resp.headers.values(), *resp.headers.keys()]
+    for canary in CANARIES:
+        for surface in surfaces:
+            assert canary not in surface, canary
+    assert gw.up.calls == ["primary"]
+    assert [r[1] for r in rows] == [0]
 
 
 # --- logging -----------------------------------------------------------------------------

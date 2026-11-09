@@ -554,3 +554,39 @@ def test_forwarded_request_to_secondary_uses_secondary_model_and_key():
     assert json.loads(secondary_req.content) == {**BODY, "model": "secondary-model"}
     assert secondary_req.headers["authorization"] == f"Bearer {SECONDARY_KEY}"
     assert PRIMARY_KEY not in str(dict(secondary_req.headers))
+
+
+# --- a 2xx body that carries an upstream error ------------------------------------------
+
+
+def error_in_200() -> Handler:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"error": {"message": "Traceback sk-LEAK"}})
+
+    return handler
+
+
+def test_primary_2xx_error_without_choices_raises_upstream_error_without_failover():
+    up = Upstreams(error_in_200(), ok("secondary"))
+    with pytest.raises(UpstreamError) as info:
+        run(up)
+    assert info.value.status == 502
+    assert info.value.message == UpstreamError.message
+    assert up.calls == ["primary"]
+
+
+def test_secondary_2xx_error_without_choices_after_failover_raises_upstream_error():
+    up = Upstreams(status(429), error_in_200())
+    with pytest.raises(UpstreamError) as info:
+        run(up)
+    assert info.value.status == 502
+    assert up.calls == ["primary", "secondary"]
+
+
+def test_2xx_body_with_both_error_and_choices_is_a_success():
+    async def both(request):
+        return httpx2.Response(200, json={"error": {"message": "warn"}, "choices": []})
+
+    result = run(Upstreams(both, ok("secondary")))
+    assert (result.provider, result.status) == ("primary", 200)
+    assert result.body["choices"] == []

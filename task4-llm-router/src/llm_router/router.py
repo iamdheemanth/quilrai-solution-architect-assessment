@@ -103,6 +103,10 @@ def _classify(provider: Provider, status: int, raw: bytes) -> _Outcome:
     if not is_json_safe(parsed):
         logger.warning("upstream %s returned a body that cannot be re-encoded", provider.name)
         return _ERROR
+    if parsed.get("error") and "choices" not in parsed:
+        # Some providers report failures inside a 2xx. Never relay that text to a client.
+        logger.warning("upstream %s returned an error object in a 2xx body", provider.name)
+        return _ERROR
     return _Outcome("ok", status, parsed)
 
 

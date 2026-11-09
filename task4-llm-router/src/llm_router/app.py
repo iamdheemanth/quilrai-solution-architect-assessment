@@ -31,7 +31,7 @@ import anyio
 import httpx2
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
@@ -212,7 +212,11 @@ async def _handle(request: Request, request_id: str, log: _RequestLog) -> Respon
     try:
         tenant = authenticate(request.headers, settings)
         log.tenant = tenant[:_TENANT_PREFIX]
-        body = _parse(await _read_body(request))
+        try:
+            raw_body = await _read_body(request)
+        except ClientDisconnect:
+            raise ClientDisconnected() from None
+        body = _parse(raw_body)
         estimate, forward = estimate_tokens(body, settings.default_max_tokens)
         log.est_tokens = estimate
         reserve_attempted = True  # reserve is not shielded: a cancelled one may still commit
@@ -286,7 +290,7 @@ def create_app(
                 )
                 app.state.limiter = owned_limiter
             if upstream_client is None:
-                owned_client = httpx2.AsyncClient(follow_redirects=False)
+                owned_client = httpx2.AsyncClient(follow_redirects=False, trust_env=False)
                 owned_client.headers.clear()  # never send httpx2 defaults (user-agent etc.)
                 app.state.upstream = owned_client
             yield

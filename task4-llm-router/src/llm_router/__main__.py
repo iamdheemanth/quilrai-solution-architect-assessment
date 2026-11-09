@@ -26,7 +26,7 @@ def main() -> None:
         force=True,
     )
     for handler in logging.getLogger().handlers:
-        install_request_id_filter(handler)  # every record (uvicorn's too) gets request_id
+        install_request_id_filter(handler)  # every root-logger record gets request_id
     # httpx2 logs every upstream request URL at INFO; keep that out of the router log.
     for noisy in ("httpx2", "httpcore2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
