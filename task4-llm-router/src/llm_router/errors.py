@@ -51,6 +51,28 @@ class InvalidRequest(GatewayError):
         super().__init__(message=message, param=param)
 
 
+class PayloadTooLarge(GatewayError):
+    status = 413
+    code = "payload_too_large"
+    type = "invalid_request_error"
+    message = "The request body is too large."
+
+
+class NotFound(GatewayError):
+    status = 404
+    code = "not_found"
+    type = "invalid_request_error"
+    message = "Not found."
+
+
+class MethodNotAllowed(GatewayError):
+    status = 405
+    code = "method_not_allowed"
+    type = "invalid_request_error"
+    message = "Method not allowed."
+    headers = {"Allow": "POST"}
+
+
 class RequestExceedsRateLimit(GatewayError):
     status = 400
     code = "request_exceeds_rate_limit"

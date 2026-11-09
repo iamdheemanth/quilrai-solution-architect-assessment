@@ -192,3 +192,7 @@ class AsyncLimiter:
     async def refund(self, request_id: str) -> None:
         with anyio.CancelScope(shield=True):
             await self._run(self._limiter.refund, request_id)
+
+    def close(self) -> None:
+        """Close the underlying connection (called at app shutdown, after requests drain)."""
+        self._limiter.close()
