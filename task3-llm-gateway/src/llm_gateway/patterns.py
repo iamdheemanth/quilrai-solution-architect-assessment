@@ -49,14 +49,19 @@ def luhn_ok(digits: str) -> bool:
 
 
 def valid(m: "regex.Match") -> bool:
-    kind = m.lastgroup
-    text = m.group()
-    if kind == "SSN":
-        area, group, serial = text.split("-")
-        return area not in ("000", "666") and area[0] != "9" and group != "00" and serial != "0000"
-    if kind == "CC":
-        digits = text.replace(" ", "").replace("-", "")
-        return 13 <= len(digits) <= 19 and luhn_ok(digits)
+    """Decide whether a pattern match is redacted (a rejected match is emitted verbatim).
+
+    A guardrail should fail toward redaction, so shape alone decides for anything that is
+    written like an SSN or a separated card number, whether or not the digits are a
+    "real" number (made-up and test values are still PII-shaped). The Luhn check is kept
+    only for unseparated 13 to 19 digit runs, which would otherwise catch timestamps,
+    order numbers and other identifiers.
+    """
+    if m.lastgroup == "CC":
+        text = m.group()
+        if text.isdigit():
+            return luhn_ok(text)
+        return True
     return True
 
 

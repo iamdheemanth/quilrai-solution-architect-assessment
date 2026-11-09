@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -194,3 +195,36 @@ def test_invalid_config_exits_2_with_stderr_message(make_session):
     assert s.close(timeout=10) == 2
     assert "CUSTOMER_ID_CHARSET" in s.stderr_text
     assert s.stdout_lines == []
+
+
+def test_piped_batch_is_fully_answered_before_exit_on_eof():
+    """`printf '...' | customer-mcp`: stdin closes right after the last request, and every
+    reply, including the last one, must still be written before the process exits."""
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "pipe-test", "version": "0"},
+        },
+    }
+    calls = [
+        {
+            "jsonrpc": "2.0",
+            "id": i,
+            "method": "tools/call",
+            "params": {"name": "get_customer_record", "arguments": {"customer_id": cid}},
+        }
+        for i, cid in ((2, "CUST-00001"), (3, "BAD"), (4, "CUST-00002"))
+    ]
+    batch = [init, {"jsonrpc": "2.0", "method": "notifications/initialized"}, *calls]
+    stdin = "".join(json.dumps(m) + "\n" for m in batch)
+    proc = subprocess.run(
+        SERVER_CMD, input=stdin, capture_output=True, text=True, timeout=30, check=False
+    )
+    assert proc.returncode == 0
+    replies = {json.loads(line)["id"]: json.loads(line) for line in proc.stdout.splitlines()}
+    assert set(replies) == {1, 2, 3, 4}
+    assert replies[3]["error"]["code"] == -32602
