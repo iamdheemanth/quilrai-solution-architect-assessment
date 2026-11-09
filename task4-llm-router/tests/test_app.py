@@ -128,6 +128,7 @@ class Gw:
     core: object
     db: str
     settings: object
+    app: object = None
 
     async def post(self, body=BODY, key: str | None = KEY, **kw) -> httpx2.Response:
         headers = dict(kw.pop("headers", {}))
@@ -159,7 +160,7 @@ async def gateway(
     app = create_app(settings, upstream_client=upstream, limiter=AsyncLimiter(core))
     client = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://router")
     try:
-        yield Gw(client, up, core, db, settings)
+        yield Gw(client, up, core, db, settings, app)
     finally:
         await client.aclose()
         await upstream.aclose()
@@ -387,6 +388,51 @@ async def test_400_invalid_request(tmp_path, content, message, param):
         rows = gw.rows()
     assert_error(resp, 400, "invalid_request", "invalid_request_error", message, param)
     assert gw.up.calls == [] and rows == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"messages": [], "temperature": NaN}',
+        b'{"messages": [], "temperature": 1e999}',
+        b'{"messages": [{"role": "user", "content": "\\ud800"}]}',
+    ],
+    ids=["nan", "overflow-to-infinity", "lone-surrogate"],
+)
+async def test_400_body_that_cannot_be_forwarded_is_rejected_before_reserve(tmp_path, content):
+    async with gateway(tmp_path) as gw:
+        resp = await gw.post(content)
+        rows = gw.rows()
+    assert_error(
+        resp, 400, "invalid_request", "invalid_request_error", "Request body must be valid JSON."
+    )
+    assert gw.up.calls == [] and rows == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"id": "x", "score": NaN}',
+        b'{"id": "x", "text": "\\ud800"}',
+        b'{"id": "x", "score": 1e999}',
+        b'{"a":' * 100_000 + b"1" + b"}" * 100_000,
+    ],
+    ids=["nan", "lone-surrogate", "overflow-to-infinity", "deep-nesting"],
+)
+async def test_502_upstream_2xx_body_that_cannot_be_relayed_refunds_without_failover(
+    tmp_path, content
+):
+    async def primary(request):
+        return httpx2.Response(200, content=content)
+
+    async with gateway(tmp_path, primary) as gw:
+        resp = await gw.post()
+        rows = gw.rows()
+    rid = assert_error(
+        resp, 502, "upstream_error", "api_error", "The upstream provider returned an error."
+    )
+    assert gw.up.calls == ["primary"]
+    assert rows == [(tenant_id(PEPPER, KEY), 0, rid)]
 
 
 async def test_stream_false_is_accepted(tmp_path):
@@ -655,6 +701,93 @@ async def test_client_disconnect_mid_route_refunds_the_reservation(tmp_path, cap
     assert "outcome=client_disconnected" in info.getMessage()
 
 
+async def _asgi_post(app, receive) -> list[dict]:
+    """Drive the app with a hand-written ``receive``, as a real server would."""
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"router"),
+            (b"authorization", f"Bearer {KEY}".encode()),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("router", 80),
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+def _body_messages() -> list[dict]:
+    raw = json.dumps(BODY).encode()
+    return [
+        {"type": "http.request", "body": raw[:10], "more_body": True},
+        {"type": "http.request", "body": raw[10:], "more_body": False},
+    ]
+
+
+async def test_disconnect_during_stalled_primary_stops_failover_and_refunds(tmp_path, caplog):
+    flags = {"entered": anyio.Event()}
+    pending = _body_messages()
+
+    async def receive() -> dict:
+        if pending:
+            return pending.pop(0)
+        await flags["entered"].wait()  # the client leaves only once the primary has stalled
+        return {"type": "http.disconnect"}
+
+    async with gateway(tmp_path, stall(flags), PRIMARY_TIMEOUT_MS="1000") as gw:
+        with caplog.at_level(logging.INFO, logger="llm_router"):
+            with anyio.fail_after(5):
+                sent = await _asgi_post(gw.app, receive)
+        rows = gw.rows()
+    assert gw.up.calls == ["primary"]
+    assert [r[1] for r in rows] == [0]
+    assert sent[0]["status"] == 499  # nobody reads it, but the ASGI cycle still completes
+    [info] = info_records(caplog)
+    assert " status=499 outcome=client_disconnected " in info.getMessage()
+
+
+async def test_watcher_leaves_a_normal_request_untouched(tmp_path):
+    state = {"watcher_cancelled": False}
+    pending = _body_messages()
+    # A server may wake receive() with an empty body message: it must not count as a disconnect.
+    pending.append({"type": "http.request", "body": b"", "more_body": False})
+
+    async def receive() -> dict:
+        if pending:
+            return pending.pop(0)
+        try:
+            await anyio.Event().wait()
+        except anyio.get_cancelled_exc_class():
+            state["watcher_cancelled"] = True
+            raise
+        raise AssertionError("unreachable")
+
+    async with gateway(tmp_path) as gw:
+        with anyio.fail_after(5):
+            sent = await _asgi_post(gw.app, receive)
+        rows = gw.rows()
+    assert sent[0]["status"] == 200
+    assert gw.up.calls == ["primary"]
+    assert json.loads(gw.up.requests[0].content) == {**BODY, "model": "primary-model"}
+    assert [r[1] for r in rows] == [7]
+    assert pending == []
+    assert state["watcher_cancelled"] is True  # stopped as soon as route finished
+
+
 # --- Review Focus 4: no planted secret ever reaches a client -----------------------------
 
 CANARIES = (
@@ -894,6 +1027,7 @@ def test_main_configures_logging_and_runs_uvicorn(monkeypatch, tmp_path):
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 8123
     assert seen["server_header"] is False
+    assert seen["access_log"] is False  # uvicorn's would be a second INFO line per request
     assert seen["log_level"] == "debug"
     assert seen["app"].state.settings.port == 8123
 

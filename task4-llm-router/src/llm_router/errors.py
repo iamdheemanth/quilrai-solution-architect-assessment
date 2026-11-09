@@ -73,6 +73,15 @@ class MethodNotAllowed(GatewayError):
     headers = {"Allow": "POST"}
 
 
+class ClientDisconnected(GatewayError):
+    """The client left mid-request. The response is only there to finish the ASGI cycle."""
+
+    status = 499
+    code = "client_disconnected"
+    type = "invalid_request_error"
+    message = "The client closed the connection."
+
+
 class RequestExceedsRateLimit(GatewayError):
     status = 400
     code = "request_exceeds_rate_limit"

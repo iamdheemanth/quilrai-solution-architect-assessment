@@ -35,6 +35,7 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         server_header=False,
+        access_log=False,  # the app's own line is the single INFO record per request
         log_level=settings.log_level.lower(),
     )
 

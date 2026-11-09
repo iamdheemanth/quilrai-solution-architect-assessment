@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -238,6 +240,43 @@ async def test_leaky_upstream_never_reaches_the_client(
     for canary in (*LEAK_CANARIES, PRIMARY_KEY, SECONDARY_KEY, "127.0.0.1"):
         for surface in surfaces:
             assert canary not in surface, canary
+
+
+def _row_tokens(db_path) -> int | None:
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute("SELECT tokens FROM usage").fetchone()
+    return None if row is None else row[0]
+
+
+def _wait_for_tokens(db_path, predicate) -> int | None:
+    deadline = time.monotonic() + 5
+    while True:
+        tokens = _row_tokens(db_path)
+        if tokens is not None and predicate(tokens):
+            return tokens
+        if time.monotonic() > deadline:
+            return tokens
+        time.sleep(0.01)
+
+
+def test_real_socket_close_during_stalled_primary_refunds_without_failover(tmp_path):
+    """Refund (0) and not the secondary's usage (50) proves failover never ran."""
+    payload = json.dumps({"model": "m", "messages": MESSAGES}).encode()
+    head = (
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: router\r\n"
+        f"Authorization: Bearer {TENANT_KEY}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n\r\n"
+    ).encode()
+    db_path = tmp_path / "router.db"
+    primary = {"behavior": "slow", "delay_s": 1.5}
+    with stack(tmp_path, primary, {"behavior": "ok"}, PRIMARY_TIMEOUT_MS="1000") as port:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(head + payload)
+            reserved = _wait_for_tokens(db_path, lambda tokens: tokens > 0)
+        assert reserved is not None and reserved > 50
+        assert _wait_for_tokens(db_path, lambda tokens: tokens != reserved) == 0
 
 
 async def test_wrong_tenant_key_is_authentication_error(tmp_path):

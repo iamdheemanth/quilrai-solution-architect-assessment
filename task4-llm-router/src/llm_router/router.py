@@ -57,6 +57,19 @@ _TIMEOUT = _Outcome("timeout")
 _ERROR = _Outcome("error")
 
 
+def is_json_safe(value: Any) -> bool:
+    """Whether strict JSON encoding to UTF-8 succeeds, as forwarding and relaying both need.
+
+    ``json.loads`` accepts what they cannot emit: NaN and Infinity, numbers that overflow to
+    infinity (``1e999``) and lone surrogates (``"\\ud800"``).
+    """
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, RecursionError):  # UnicodeEncodeError is a ValueError
+        return False
+    return True
+
+
 def _build_request(provider: Provider, body: dict) -> httpx2.Request:
     # Built directly (not via client.build_request) so no client-level default headers,
     # cookies or auth can ride along: the upstream sees exactly these headers.
@@ -81,11 +94,14 @@ def _classify(provider: Provider, status: int, raw: bytes) -> _Outcome:
         return _ERROR
     try:
         parsed: Any = json.loads(raw)
-    except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueErrors
+    except (ValueError, RecursionError):  # bad JSON, bad UTF-8, or absurd nesting
         logger.warning("upstream %s returned a malformed JSON body", provider.name, exc_info=True)
         return _ERROR
     if not isinstance(parsed, dict):
         logger.warning("upstream %s returned a non-object JSON body", provider.name)
+        return _ERROR
+    if not is_json_safe(parsed):
+        logger.warning("upstream %s returned a body that cannot be re-encoded", provider.name)
         return _ERROR
     return _Outcome("ok", status, parsed)
 

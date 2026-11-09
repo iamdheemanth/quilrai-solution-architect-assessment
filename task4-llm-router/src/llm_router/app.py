@@ -7,7 +7,7 @@ Request flow (each step only runs if the previous one succeeded):
 3. read the body (1 MiB cap, 413) and parse it: a JSON object with a ``messages`` list,
    ``stream: true`` rejected;
 4. ``estimate_tokens`` then ``limiter.reserve`` (one reservation per request);
-5. ``route`` (primary, failover to secondary);
+5. ``route`` (primary, failover to secondary), abandoned if the client disconnects;
 6. settle the reservation in a shielded ``finally``: reconcile to ``usage.total_tokens`` on
    success, refund on every other exit (gateway error, unexpected exception, cancellation);
 7. respond: the upstream JSON and 2xx status with our headers only, or a gateway error;
@@ -39,6 +39,7 @@ from .auth import authenticate
 from .config import Settings
 from .context import install_request_id_filter, request_id_var
 from .errors import (
+    ClientDisconnected,
     GatewayError,
     InternalError,
     InvalidRequest,
@@ -50,7 +51,7 @@ from .errors import (
     unhandled_exception_handler,
 )
 from .limiter import AsyncLimiter, Reservation, SqliteTokenLimiter
-from .router import RouteResult, route
+from .router import RouteResult, is_json_safe, route
 from .tokens import estimate_tokens
 
 logger = logging.getLogger("llm_router")
@@ -115,6 +116,8 @@ def _parse(raw: bytes) -> dict[str, Any]:
         body = json.loads(raw)
     except (ValueError, RecursionError):  # bad JSON, bad UTF-8, or absurd nesting
         raise InvalidRequest("Request body must be valid JSON.") from None
+    if not is_json_safe(body):  # NaN, 1e999 or a lone surrogate could never be forwarded
+        raise InvalidRequest("Request body must be valid JSON.")
     if not isinstance(body, dict):
         raise InvalidRequest("Request body must be a JSON object.")
     if not isinstance(body.get("messages"), list):
@@ -165,6 +168,41 @@ async def _settle(limiter: AsyncLimiter, request_id: str, actual: int | None) ->
             logger.warning("could not %s reservation", action, exc_info=True)
 
 
+async def _route_until_disconnect(
+    request: Request, client: httpx2.AsyncClient, settings: Settings, body: dict[str, Any]
+) -> RouteResult:
+    """Run ``route``, abandoning it if the client goes away.
+
+    Starlette delivers no cancellation on disconnect, so without this a client that left
+    during a stalled primary would still trigger failover and be charged for it. Call this
+    only after the body is fully read, so the watcher can never consume a body message.
+
+    A result that was already produced is kept even if the disconnect lands at the same
+    moment. Exceptions are carried out of the group by hand so callers see the original
+    exception rather than an ExceptionGroup.
+    """
+    result: RouteResult | None = None
+    failure: Exception | None = None
+
+    async def watch(scope: anyio.CancelScope) -> None:
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+        scope.cancel()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(watch, tg.cancel_scope)
+        try:
+            result = await route(client, settings, body)
+        except Exception as exc:
+            failure = exc
+        tg.cancel_scope.cancel()
+    if failure is not None:
+        raise failure
+    if result is None:
+        raise ClientDisconnected()
+    return result
+
+
 async def _handle(request: Request, request_id: str, log: _RequestLog) -> Response:
     state = request.app.state
     settings: Settings = state.settings
@@ -179,7 +217,7 @@ async def _handle(request: Request, request_id: str, log: _RequestLog) -> Respon
         log.est_tokens = estimate
         reserve_attempted = True  # reserve is not shielded: a cancelled one may still commit
         reservation = await limiter.reserve(tenant, request_id, estimate)
-        result = await route(state.upstream, settings, forward)
+        result = await _route_until_disconnect(request, state.upstream, settings, forward)
         log.provider = result.provider
         log.fallback_reason = result.fallback_reason or "-"
         response = _success(result, reservation, request_id)
