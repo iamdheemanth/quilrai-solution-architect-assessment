@@ -179,3 +179,21 @@ async def test_events_per_write_batches_without_changing_body():
 async def test_delay_still_completes():
     resp = await post(build_mock_app(tokens=["a", "b"], delay=0.001), {})
     assert content_of(parse(resp.content)) == "ab"
+
+
+def test_mock_fault_env_var_validated_and_passed(monkeypatch):
+    import mock_llm.server as server
+
+    seen = {}
+    monkeypatch.setattr(server.uvicorn, "run", lambda app, **kw: seen.update(kw))
+    monkeypatch.setattr(server, "build_mock_app", lambda **kw: seen.update(app=kw) or object())
+    monkeypatch.setenv("MOCK_FAULT", "crlf")
+    server.main()
+    assert seen["app"]["fault"] == "crlf"
+    monkeypatch.setenv("MOCK_FAULT", "bogus")
+    with pytest.raises(SystemExit) as exc:
+        server.main()
+    assert exc.value.code == 2
+    monkeypatch.delenv("MOCK_FAULT")
+    server.main()
+    assert seen["app"]["fault"] is None

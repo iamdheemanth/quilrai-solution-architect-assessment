@@ -21,6 +21,33 @@ ERROR_FRAME = (
 )
 _DONE = b"data: [DONE]\n\n"
 _ENVELOPE = ("id", "object", "created", "model", "system_fingerprint")
+_TOP_SKIP = (*_ENVELOPE, "service_tier", "obfuscation", "choices")
+_TEXT_CHANNELS = ("content", "refusal", "reasoning_content", "reasoning")
+_MAX_DEPTH = 64
+
+
+def _redact_tree(value, depth: int = 0, parent: str = ""):
+    """Return ``value`` with every string leaf batch-redacted (keys untouched).
+
+    An ``arguments`` string directly under ``function`` / ``function_call`` uses args mode.
+    """
+    if depth > _MAX_DEPTH:
+        raise ValueError("JSON nesting too deep")
+    if isinstance(value, str):
+        return batch_redact(value)
+    if isinstance(value, dict):
+        fn = parent in ("function", "function_call")
+        return {
+            k: (
+                batch_redact(v, args=True)
+                if fn and k == "arguments" and isinstance(v, str)
+                else _redact_tree(v, depth + 1, k)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_tree(v, depth + 1, parent) for v in value]
+    return value
 
 
 def _no_dupes(pairs: list[tuple[str, object]]) -> dict:
@@ -39,6 +66,7 @@ def _frame(obj: dict) -> bytes:
 class StreamTransformer:
     def __init__(self) -> None:
         self.done = False
+        self.saw_upstream_error = False
         self._red: dict[tuple, StreamRedactor] = {}
         self._all: list[StreamRedactor] = []  # every redactor ever made, for stats
         self._seen: set[int] = set()
@@ -64,7 +92,7 @@ class StreamTransformer:
     @staticmethod
     def _synthetic_choice(i: int, released: dict[tuple, str]) -> dict | None:
         delta: dict = {}
-        for field in ("content", "refusal"):
+        for field in _TEXT_CHANNELS:
             if released.get((i, field)):
                 delta[field] = released[(i, field)]
         tools = sorted((k[2], t) for k, t in released.items() if k[1] == "tool" and t)
@@ -113,27 +141,25 @@ class StreamTransformer:
             raise ValueError("upstream data frame is not a JSON object")
         if obj.get("error") is not None:
             self.discard()
-            err = obj["error"]
-            if isinstance(err, dict) and isinstance(err.get("message"), str):
-                err["message"] = batch_redact(err["message"])
-            elif isinstance(err, str):
-                obj["error"] = batch_redact(err)
-            return _frame(obj)
+            self.saw_upstream_error = True
+            return _frame(redact_json_body(obj))
         env = {k: obj[k] for k in _ENVELOPE if k in obj}
         self._env = env
+        top_changed = self._scrub_top(obj)
         if "choices" not in obj:
-            return ev.raw
+            return _frame(obj) if top_changed else ev.raw
         choices = obj["choices"]
         if not isinstance(choices, list):
             raise ValueError("choices is not a list")
         if not choices:
-            if "usage" in obj:  # terminal usage chunk: seal every unfinished choice
-                return self._close_unfinished() + ev.raw
-            return ev.raw
+            out = _frame(obj) if top_changed else ev.raw
+            if obj.get("usage") is not None:  # terminal usage chunk: seal every unfinished choice
+                return self._close_unfinished() + out
+            return out
 
         for ch in choices:
             self._validate_choice(ch)
-        changed = False
+        changed = top_changed
         synthetic: list[dict] = []
         for ch in choices:
             c, syn = self._transform_choice(ch)
@@ -144,9 +170,62 @@ class StreamTransformer:
         return pre + (_frame(obj) if changed else ev.raw)
 
     @staticmethod
+    def _scrub_top(obj: dict) -> bool:
+        """Redact string leaves of top-level fields that are neither envelope nor choices."""
+        changed = False
+        for k in obj:
+            if k in _TOP_SKIP:
+                continue
+            new = _redact_tree(obj[k], 0, k)
+            if new != obj[k]:
+                obj[k] = new
+                changed = True
+        return changed
+
+    @staticmethod
+    def _scrub_choice(ch: dict) -> bool:
+        """Redact string leaves of a choice outside the streamed channels (per frame only)."""
+        changed = False
+
+        def sub(container: dict, key: str, parent: str = "") -> None:
+            nonlocal changed
+            new = _redact_tree(container[key], 1, parent or key)
+            if new != container[key]:
+                container[key] = new
+                changed = True
+
+        for k in list(ch):
+            if k not in ("index", "finish_reason", "logprobs", "delta"):
+                sub(ch, k)
+        delta = ch.get("delta")
+        if not isinstance(delta, dict):
+            return changed
+        for k in list(delta):
+            if k in (*_TEXT_CHANNELS, "role"):
+                continue
+            if k == "tool_calls" and isinstance(delta[k], list):
+                for tc in delta[k]:
+                    for tk in list(tc):
+                        if tk == "index":
+                            continue
+                        if tk == "function" and isinstance(tc[tk], dict):
+                            for fk in list(tc[tk]):
+                                if fk != "arguments":
+                                    sub(tc[tk], fk)
+                        else:
+                            sub(tc, tk)
+            elif k == "function_call" and isinstance(delta[k], dict):
+                for fk in list(delta[k]):
+                    if fk != "arguments":
+                        sub(delta[k], fk)
+            else:
+                sub(delta, k)
+        return changed
+
+    @staticmethod
     def _text_fields(delta: dict):
         """Yield (container, name, key_suffix, args) for each text channel; validates shapes."""
-        for name in ("content", "refusal"):
+        for name in _TEXT_CHANNELS:
             yield delta, name, (name,), False
         tcs = delta.get("tool_calls")
         if tcs is not None:
@@ -192,6 +271,7 @@ class StreamTransformer:
         if ch.get("logprobs") is not None:
             ch["logprobs"] = None
             changed = True
+        changed = self._scrub_choice(ch) or changed
         delta = ch.get("delta") or {}
         finishing = ch.get("finish_reason") is not None
         released: dict[tuple, str] = {}  # finish only: the chunk's own text moves to synthetic
@@ -266,26 +346,31 @@ def redact_completion(obj: dict) -> dict:
     return out
 
 
-_MAX_DEPTH = 64
-
-
-def _redact_leaves(value, depth: int = 0):
-    """Batch-redact every string leaf (dict values, list items); keys are untouched."""
-    if depth > _MAX_DEPTH:
-        raise ValueError("JSON nesting too deep")
-    if isinstance(value, str):
-        return batch_redact(value)
-    if isinstance(value, dict):
-        return {k: _redact_leaves(v, depth + 1) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_leaves(v, depth + 1) for v in value]
-    return value
+def _check_completion_shape(obj: dict) -> None:
+    choices = obj.get("choices")
+    if choices is None:
+        return
+    if not isinstance(choices, list):
+        raise ValueError("choices is not a list")
+    for ch in choices:
+        msg = ch.get("message") if isinstance(ch, dict) else None
+        if isinstance(msg, dict) and msg.get("tool_calls") is not None:
+            if not isinstance(msg["tool_calls"], list):
+                raise ValueError("tool_calls is not a list")
 
 
 def redact_json_body(obj: dict) -> dict:
-    """Redact any JSON reply by content: completion semantics for ``choices``, plus every
-    other string leaf. Raises on malformed shapes or excessive nesting (caller fails closed)."""
-    return _redact_leaves(redact_completion(obj))
+    """Redact any JSON reply by content in one pass: every string leaf is batch-redacted
+    (tool/function ``arguments`` in args mode) and ``choices[].logprobs`` is nulled. Raises on
+    excessive nesting (caller fails closed)."""
+    _check_completion_shape(obj)
+    out = _redact_tree(obj)
+    choices = out.get("choices")
+    if isinstance(choices, list):
+        for ch in choices:
+            if isinstance(ch, dict) and "logprobs" in ch:
+                ch["logprobs"] = None
+    return out
 
 
 def redact_error_body(obj: dict) -> dict:

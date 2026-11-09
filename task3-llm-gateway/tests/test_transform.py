@@ -430,8 +430,9 @@ _PIECES = st.sampled_from(
     seed=st.randoms(use_true_random=False),
     logprobs=st.booleans(),
     usage=st.booleans(),
+    reasoning=st.booleans(),
 )
-def test_transformer_property(texts, seed, logprobs, usage):
+def test_transformer_property(texts, seed, logprobs, usage, reasoning):
     # split each choice's text into random deltas (empty ones included)
     queues = []
     for t in texts:
@@ -445,7 +446,10 @@ def test_transformer_property(texts, seed, logprobs, usage):
         i, q = seed.choice([p for p in pending if p[1]])
         piece = q.pop(0)
         last = not q
-        frames.append(sse(chunk(piece, index=i, logprobs=lp, finish="stop" if last else None)))
+        obj = chunk(piece, index=i, logprobs=lp, finish="stop" if last else None)
+        if reasoning:
+            obj["choices"][0]["delta"]["reasoning_content"] = piece
+        frames.append(sse(obj))
     if usage:
         frames.append(sse(chunk(choices=[], usage={"total_tokens": 1})))
     frames.append(sse("[DONE]"))
@@ -455,7 +459,139 @@ def test_transformer_property(texts, seed, logprobs, usage):
     assert objs[-1] == "[DONE]" and objs.count("[DONE]") == 1
     for i, t in enumerate(texts):
         assert content_of(objs, i) == batch_redact(t)
+        if reasoning:
+            got = "".join(
+                c["delta"].get("reasoning_content") or ""
+                for o in objs[:-1]
+                for c in o["choices"]
+                if c["index"] == i
+            )
+            assert got == batch_redact(t)
     for o in objs[:-1]:
         for c in o["choices"]:
             assert c.get("logprobs") is None
     assert tx.on_event(events(sse(chunk("zz ")))[0]) == b""
+
+
+# ---- final-review fixes (H1-H3, H5, H6) ----
+
+
+def test_error_frame_redacts_entire_frame():
+    tx = StreamTransformer()
+    frame = {
+        "error": {"message": "x", "metadata": {"raw": "user john@x.com"}},
+        "choices": [{"index": 0, "delta": {"content": "ssn 123-45-6789 "}}],
+    }
+    out = run(tx, sse(frame))
+    assert b"john@x.com" not in out and b"123-45-6789" not in out
+    (o,) = parse_out(out)
+    assert isinstance(o["error"], dict)
+    assert tx.saw_upstream_error and tx.done
+    assert run(tx, sse("[DONE]")) == b""
+
+
+def test_error_frame_string_error_and_tool_args():
+    tx = StreamTransformer()
+    obj = {
+        "error": "bad john@x.com",
+        "choices": [{"delta": {"tool_calls": [tool(0, '{"e":"a@b.com"}')], "content": "a@b.com "}}],
+    }
+    out = run(tx, sse(obj))
+    assert b"@b.com" not in out and b"@x.com" not in out
+    (o,) = parse_out(out)
+    assert o["error"] == "bad [REDACTED]"
+    args = o["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(args) == {"e": "[REDACTED]"}
+
+
+def _channel_stream(field, pieces):
+    frames = [sse(_with_delta({field: p})) for p in pieces]
+    frames.append(sse(chunk(finish="stop")))
+    frames.append(sse("[DONE]"))
+    return frames
+
+
+def _with_delta(delta, index=0, finish=None):
+    obj = chunk("")
+    obj["choices"] = [{"index": index, "delta": delta, "logprobs": None, "finish_reason": finish}]
+    return obj
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+def test_reasoning_channels_equal_batch_and_flush_before_finish(field):
+    text = "think john@example.com and 123-45-6789 ok mail a@b.co"
+    cuts = [0, 7, 15, 20, 31, 40, len(text)]
+    pieces = [text[a:b] for a, b in zip(cuts, cuts[1:], strict=False)]
+    out = run(StreamTransformer(), *_channel_stream(field, pieces))
+    objs = parse_out(out)
+    got = "".join(c["delta"].get(field) or "" for o in objs[:-1] for c in o["choices"])
+    assert got == batch_redact(text)
+    assert "john@example.com" not in out.decode()
+    finish_at = next(
+        n for n, o in enumerate(objs[:-1]) if o["choices"][0].get("finish_reason") == "stop"
+    )
+    assert got == "".join(
+        c["delta"].get(field) or "" for o in objs[:finish_at] for c in o["choices"]
+    )
+
+
+def test_reasoning_non_string_fails_closed():
+    with pytest.raises(ValueError):
+        run(StreamTransformer(), sse(_with_delta({"reasoning_content": 5})))
+
+
+def test_audio_transcript_redacted():
+    obj = _with_delta({"audio": {"transcript": "ssn 123-45-6789", "id": "a"}})
+    out = run(StreamTransformer(), sse(obj))
+    assert b"123-45-6789" not in out
+    assert parse_out(out)[0]["choices"][0]["delta"]["audio"]["transcript"] == "ssn [REDACTED]"
+
+
+def test_frame_without_choices_redacted():
+    out = run(StreamTransformer(), sse({"id": "c", "note": "john@x.com"}))
+    assert parse_out(out) == [{"id": "c", "note": "[REDACTED]"}]
+
+
+def test_message_object_in_stream_chunk_redacted():
+    obj = _with_delta({})
+    obj["choices"][0]["message"] = {"content": "john@x.com"}
+    out = run(StreamTransformer(), sse(obj))
+    assert b"john@x.com" not in out
+
+
+def test_pii_free_frame_with_unknown_fields_byte_identical():
+    obj = _with_delta({"audio": {"transcript": "hello"}, "x": [1, "y"]})
+    obj["note"] = {"k": "v"}
+    raw = b"data: " + json.dumps(obj).encode() + b"\n\n"  # non-compact: proves raw reuse
+    assert run(StreamTransformer(), raw) == raw
+
+
+def test_too_deep_unknown_field_fails_closed():
+    deep: object = "x"
+    for _ in range(80):
+        deep = [deep]
+    with pytest.raises(ValueError):
+        run(StreamTransformer(), sse({"id": "c", "note": deep}))
+
+
+def test_non_stream_tool_args_redacted_once_and_valid_json():
+    from llm_gateway.transform import redact_json_body
+
+    args = json.dumps({"a": "\n@x.com"})
+    obj = {
+        "choices": [{"message": {"tool_calls": [{"function": {"name": "f", "arguments": args}}]}}]
+    }
+    out = redact_json_body(obj)
+    fixed = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(fixed) == json.loads(batch_redact(args, args=True))
+    assert chr(92) + "[REDACTED]" not in fixed
+
+
+def test_usage_null_empty_choices_does_not_seal():
+    tx = StreamTransformer()
+    run(tx, sse(chunk("hello ")))
+    run(tx, sse(chunk(choices=[]) | {"usage": None}))
+    out = run(tx, sse(chunk("world john@x.com ")), sse(chunk(finish="stop")), sse("[DONE]"))
+    objs = parse_out(out)
+    assert objs[-1] == "[DONE]"
+    assert "[REDACTED]" in content_of(objs)

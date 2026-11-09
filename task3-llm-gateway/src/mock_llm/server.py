@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Literal, get_args
 
 import anyio
 import anyio.lowlevel
@@ -194,7 +194,11 @@ def main() -> None:
     except ValueError:
         sys.stderr.write("MOCK_DELAY must be a finite float >= 0\n")
         raise SystemExit(2) from None
-    uvicorn.run(build_mock_app(delay=delay), host=host, port=port, server_header=False)
+    fault = os.environ.get("MOCK_FAULT") or None
+    if fault is not None and fault not in get_args(Fault):
+        sys.stderr.write(f"MOCK_FAULT must be one of: {', '.join(get_args(Fault))}\n")
+        raise SystemExit(2)
+    uvicorn.run(build_mock_app(delay=delay, fault=fault), host=host, port=port, server_header=False)
 
 
 if __name__ == "__main__":

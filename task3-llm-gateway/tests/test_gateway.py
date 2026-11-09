@@ -510,7 +510,7 @@ def _scenarios():
             "outcome=timeout error=ReadTimeout",
         ),
         ("mid_stream", {"upstream": mid}, stream, "outcome=stream_failed error=ReadError"),
-        ("malformed", {"upstream": bad}, stream, "outcome=bad_gateway error=TypeError"),
+        ("malformed", {"upstream": bad}, stream, "outcome=bad_gateway error=ValueError"),
     ]
 
 
@@ -557,3 +557,13 @@ async def test_client_disconnect_outcome_and_upstream_closed():
     await gen.aclose()
     assert seen == [("client_disconnected", None)]
     assert stream.closed
+
+
+async def test_mid_stream_upstream_error_frame_logged_as_upstream_error(caplog):
+    parts = [sse(chunk("hi ")), sse({"error": {"message": "boom", "type": "e"}})]
+    with caplog.at_level(logging.INFO, logger="llm_gateway"):
+        async with gateway(lambda req: sse_response(parts)) as (c, _):
+            r = await post(c)
+    assert b"[DONE]" not in r.content
+    msgs = [x.getMessage() for x in _records(caplog) if x.levelno == logging.INFO]
+    assert len(msgs) == 1 and "outcome=upstream_error" in msgs[0]

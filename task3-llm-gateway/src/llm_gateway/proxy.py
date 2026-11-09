@@ -127,7 +127,7 @@ async def relay(
         outcome = "stream_failed" if tail == ERROR_FRAME else "ok"
         if tail:
             yield tail
-        if outcome == "ok" and upstream.status_code >= 400:
+        if outcome == "ok" and (tx.saw_upstream_error or upstream.status_code >= 400):
             outcome = "upstream_error"
     except Exception as exc:  # transport drop, parse error, bad frame: never log content
         outcome, error = "stream_failed", type(exc).__name__
