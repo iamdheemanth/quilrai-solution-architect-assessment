@@ -101,13 +101,15 @@ async def _attempt(client: httpx2.AsyncClient, provider: Provider, body: dict) -
             finally:
                 await response.aclose()
             result = (response.status_code, raw)  # last statement: no checkpoint after it
-    except (TimeoutError, httpx2.TimeoutException):
+    except (TimeoutError, httpx2.TimeoutException) as exc:
         if result is None:
-            # An expected outcome with no useful detail: no traceback, just the fact.
+            # An expected outcome: no traceback, just the fact and which timeout fired
+            # (TimeoutError = the total deadline, an httpx2 type = a per-phase backstop).
             logger.warning(
-                "upstream %s timed out after %d ms",
+                "upstream %s timed out after %d ms (%s)",
                 provider.name,
                 round(provider.timeout_s * 1000),
+                type(exc).__name__,
             )
             return _TIMEOUT
     except httpx2.HTTPError:
@@ -133,7 +135,9 @@ async def route(client: httpx2.AsyncClient, settings: Settings, body: dict) -> R
     # If the caller was cancelled while the primary failed, stop here rather than start the
     # secondary: outer cancellation never becomes failover.
     await anyio.lowlevel.checkpoint_if_cancelled()
-    logger.info("failing over to %s reason=%s", settings.secondary.name, reason)
+    # DEBUG, not INFO: the app emits exactly one INFO line per request, which already
+    # carries provider and fallback_reason.
+    logger.debug("failing over to %s reason=%s", settings.secondary.name, reason)
 
     secondary = await _attempt(client, settings.secondary, body)
     if secondary.kind == "ok":

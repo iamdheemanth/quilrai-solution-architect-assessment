@@ -208,17 +208,31 @@ def test_timeout_is_logged_with_provider_name_not_url(caplog):
     with caplog.at_level(logging.WARNING, logger="llm_router"):
         run(up)
     [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert record.getMessage() == "upstream primary timed out after 200 ms"
+    assert record.getMessage() == "upstream primary timed out after 200 ms (TimeoutError)"
     assert record.exc_info is None
 
 
-def test_httpx_timeout_exception_counts_as_timeout():
+def test_httpx_timeout_exception_counts_as_timeout(caplog):
     async def primary(request):
-        raise httpx2.ReadTimeout("read timed out", request=request)
+        raise httpx2.ReadTimeout("read timed out at primary.internal", request=request)
 
     up = Upstreams(primary, ok("secondary"))
-    result = run(up)
+    with caplog.at_level(logging.WARNING, logger="llm_router"):
+        result = run(up)
     assert (result.provider, result.fallback_reason) == ("secondary", "timeout")
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert record.getMessage() == "upstream primary timed out after 200 ms (ReadTimeout)"
+    assert record.exc_info is None
+
+
+def test_failover_is_not_logged_at_info(caplog):
+    """The app logs exactly one INFO line per request; the router must not add another."""
+    up = Upstreams(status(429), ok("secondary"))
+    with caplog.at_level(logging.DEBUG, logger="llm_router"):
+        run(up)
+    assert [r for r in caplog.records if r.levelno == logging.INFO] == []
+    [debug] = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    assert debug.getMessage() == "failing over to secondary reason=rate_limited"
 
 
 # --- the deadline boundary race --------------------------------------------------------
@@ -303,6 +317,42 @@ def test_outer_cancellation_propagates_and_never_triggers_failover():
     assert up.secondary_calls == 0
     assert up.calls == ["primary"]
     assert elapsed < 1.0
+
+
+def test_cancel_landing_with_primary_timeout_never_starts_secondary():
+    """Deterministic test of the checkpoint_if_cancelled guard.
+
+    The primary handler cancels the outer scope and raises ReadTimeout with no await in
+    between, so the router sees a timeout while a cancellation is pending but not yet
+    delivered. Without the guard the secondary (whose handler never awaits) would be called
+    and its answer returned; with it, cancellation propagates and the secondary is untouched.
+    """
+    holder: dict = {}
+
+    async def primary(request):
+        holder["scope"].cancel()
+        raise httpx2.ReadTimeout("read timed out", request=request)
+
+    up = Upstreams(primary, ok("secondary"))
+    settings = make_settings(timeout_ms=5000)
+    seen: list[str] = []
+
+    async def main():
+        async with up.client() as client:
+            with anyio.CancelScope() as scope:
+                holder["scope"] = scope
+                try:
+                    result = await route(client, settings, BODY)
+                except anyio.get_cancelled_exc_class():
+                    seen.append("cancelled")
+                    raise
+                seen.append(f"returned {result.provider}")
+            return scope.cancelled_caught
+
+    assert anyio.run(main) is True
+    assert seen == ["cancelled"]
+    assert up.calls == ["primary"]
+    assert up.secondary_calls == 0
 
 
 def test_outer_cancellation_during_secondary_propagates():
